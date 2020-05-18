@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <stdint.h>
+#include <endian.h>
 
 #include <chaste/types/types.h>
 #include <chaste/data_structs/vector/vector_std.h>
@@ -56,6 +57,7 @@ typedef struct
     pcap_pkthdr_t pkt_hdr;
     expcap_pktftr_t pkt_ftr;
     bool matched_once;
+    int64_t pkt_idx;
 } value_t;
 
 static volatile bool stop = false;
@@ -98,7 +100,7 @@ int read_expect (int fd, void* buff, ssize_t len, int64_t* offset, bool debug)
 
 void dprint_packet (int fd, bool expcap, pcap_pkthdr_t* pkt_hdr,
                     expcap_pktftr_t* pkt_ftr, char* packet, bool nl,
-                    bool content)
+                    bool content, int64_t pkt_idx)
 {
     char fmtd[4096] = { 0 };
 
@@ -123,8 +125,9 @@ void dprint_packet (int fd, bool expcap, pcap_pkthdr_t* pkt_hdr,
                            *((uint8_t*) packet + i));
         }
     }
-    dprintf (fd, "%i.%09i,%i%s", pkt_hdr->ts.ns.ts_sec, pkt_hdr->ts.ns.ts_nsec,
+    dprintf (fd, "%i.%09i,%i%s,", pkt_hdr->ts.ns.ts_sec, pkt_hdr->ts.ns.ts_nsec,
              pkt_hdr->caplen, fmtd);
+    dprintf (fd, "%lld", (long long)pkt_idx);
 
     if (nl)
     {
@@ -350,21 +353,22 @@ int main (int argc, char** argv)
         {
             dprintf (STDOUT_FILENO, "ref,");
             dprint_packet (STDOUT_FILENO, expcap, &pkt_hdr, pkt_ftr, pbuf, true,
-                           true);
+                           true, pkt_num + options.offset_ref);
         }
 
         value_t val;
         bzero (&val, sizeof(val));
         val.pkt_hdr = pkt_hdr;
+        val.pkt_idx = pkt_num + options.offset_ref;
         if (expcap)
         {
             val.pkt_ftr = *pkt_ftr;
         }
 
         const int64_t caplen =
-                expcap ?
-                        pkt_hdr.caplen - sizeof(expcap_pktftr_t) :
-                        pkt_hdr.caplen;
+            expcap ?
+            pkt_hdr.caplen - sizeof(expcap_pktftr_t) :
+            pkt_hdr.caplen;
 
         /*Use the whole packet as the key, and the header as the value */
         hash_map_push (hmap, pbuf, caplen, &val);
@@ -455,22 +459,21 @@ int main (int argc, char** argv)
         {
             dprintf (STDOUT_FILENO, "inp,");
             dprint_packet (STDOUT_FILENO, expcap, &pkt_hdr, pkt_ftr, pbuf, true,
-                           true);
+                           true, pkt_num + options.offset_ref);
         }
 
-        /* Look for this packet in the hash map */
-
         const int64_t caplen =
-                expcap ?
-                        pkt_hdr.caplen - sizeof(expcap_pktftr_t) :
-                        pkt_hdr.caplen;
+            expcap ?
+            pkt_hdr.caplen - sizeof(expcap_pktftr_t) :
+            pkt_hdr.caplen;
+
         ch_hash_map_it hmit = hash_map_get_first (hmap, pbuf, caplen);
         if (!hmit.key)
         {
             total_lost++;
             if (fd_inp_miss > 0)
                 dprint_packet (fd_inp_miss, expcap, &pkt_hdr, pkt_ftr, pbuf,
-                               true, true);
+                               true, true, pkt_num + options.offset_ref);
             continue;
         }
 
@@ -554,7 +557,7 @@ int main (int argc, char** argv)
             missing_input++;
             if (fd_ref_miss > 0)
                 dprint_packet (fd_ref_miss, expcap, &val->pkt_hdr,
-                               &val->pkt_ftr, hmit.key, true, true);
+                               &val->pkt_ftr, hmit.key, true, true, val->pkt_idx);
         }
 
         hash_map_next (hmap, &hmit);
@@ -571,6 +574,7 @@ int main (int argc, char** argv)
     if (fd_ref_miss > 0) close (fd_ref_miss);
 
     ch_log_info("PCAP matcher, finished\n");
+    result = 0;
     return result;
 
 }

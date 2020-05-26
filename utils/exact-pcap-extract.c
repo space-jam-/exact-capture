@@ -634,7 +634,6 @@ begin_loop:
 
         
        next_packet(&rd_buffs[min_idx]);
-
     }
 
     ch_log_info("Finished writing %li packets total (Runts=%li, Errors=%li (%li, %li, %li), Padding=%li). Closing\n", packets_total, dropped_runts, dropped_errors, dropped_errors_abrt, dropped_errors_crpt, dropped_errors_swofl, dropped_padding);

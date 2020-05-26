@@ -53,6 +53,7 @@ USE_CH_OPTIONS;
 struct {
     char*  input;
     char*  write;
+    char*  write_filtered;
     bool verbose;
     char* format;
     ch_word offset;
@@ -234,30 +235,44 @@ int read_packet(char* data, int64_t* offset, int64_t snaplen, pcap_pkthdr_t** pk
 
 }
 
-static int parse_mac_addr(char *str, unsigned char** mac_out)
+static int str_to_mac(char* str, unsigned char** mac_out)
 {
-    char *s = strtok(str, ",");
-    if(!s)
-        return -1;
-
-    if(strlen(s) == ((sizeof(unsigned char) * ETH_ALEN) * 2) + 2)
-    {
-        u64 mac = htobe64(parse_number(s, 0).val_uint) >> 16;
+    if(strlen(str) == ((sizeof(unsigned char) * ETH_ALEN) * 2) + 2){
+        u64 mac = htobe64(parse_number(str, 0).val_uint) >> 16;
         *mac_out = (unsigned char *)mac;
         return 0;
     }
     return -1;
 }
 
-static int parse_ip_addr(char *str, uint32_t* ip_out)
+static int parse_mac_opt(char* str, unsigned char** old_mac, unsigned char** new_mac)
+{
+    char* tok_old = strtok(str, ",");
+    char* tok_new = strtok(NULL, ",");
+
+    /* If there is no new MAC specified */
+    if(!tok_new && str){
+        return str_to_mac(s, old_mac);
+    }
+
+    if(str_to_mac(tok_old, old_mac) == 0 && str_to_mac(tok_new, new_mac) == 0){
+        return 0;
+    }
+
+    return -1;
+}
+
+static int parse_ip_addr(char* str, uint32_t* ip_out)
 {
     char *s = strtok(str, ",");
-    if (!s)
+    if (!s){
         return -1;
+    }
 
     struct in_addr addr;
-    if (!inet_aton(s, &addr))
+    if (!inet_aton(s, &addr)){
         return -1;
+    }
 
     *ip_out = addr.s_addr;
     return 0;
@@ -267,19 +282,21 @@ static int parse_port(char *str, uint16_t* port_out)
 {
     char *s = strtok(str, ",");
     char *p;
-    if(!s)
+    if(!s){
         return -1;
+    }
 
     *port_out = htobe16(strtol(s, &p, 0));
-    if(*p != '\0')
+    if(*p != '\0'){
         return -1;
+    }
 
     return 0;
 }
 
 static inline int compare_mac(unsigned char* lhs, unsigned char* rhs)
 {
-    return memcmp(lhs, rhs, sizeof(unsigned char) * ETH_ALEN);
+    return memcmp(lhs, rhs, sizeof(unsigned char) * ETH_ALEN) == 0;
 }
 
 static inline void copy_mac(unsigned char* dst, unsigned char* src)
@@ -301,6 +318,20 @@ static inline void get_pseudo_iphdr(struct iphdr* ip_hdr, uint16_t hdr_len, stru
     hdro->len = hdr_len;
 }
 
+static void dump_buf(char *buf, ssize_t len)
+{
+    int i;
+
+    for (i = 0; i < len; i++)
+    {
+        if ((i % 16) == 0)
+            fprintf(stderr, "\n  %04x ", i);
+        fprintf(stderr, " %02x", (uint8_t)buf[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
+
 int main(int argc, char** argv)
 {
     ch_word result = -1;
@@ -313,17 +344,29 @@ int main(int argc, char** argv)
     signal(SIGTERM, signal_handler);
 
     ch_opt_addsu(CH_OPTION_REQUIRED,'i',"input","PCAP file to read", &options.input);
-    ch_opt_addsi(CH_OPTION_OPTIONAL,'w',"write","Destination to write to ", &options.write, NULL);
+    ch_opt_addsi(CH_OPTION_REQUIRED,'w',"write","Destination to write modified packets to ", &options.write, NULL);
+
+    /* Packets which are unmodified/unfiltered will be written here. */
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'W',"write-filtered","Destination to write filtered packets to ", &options.write, NULL);
     ch_opt_addbi(CH_OPTION_FLAG,'v',"verbose","Printout verbose output", &options.verbose, false);
     ch_opt_addsu(CH_OPTION_REQUIRED,'f',"format","Input format [pcap | expcap]", &options.format);
     ch_opt_addii(CH_OPTION_OPTIONAL,'o',"offset","Offset into the file to start ", &options.offset, 0);
     ch_opt_addii(CH_OPTION_OPTIONAL,'t',"time","Time into the file to start ", &options.timens, 0);
     ch_opt_addii(CH_OPTION_OPTIONAL,'m',"max","Max packets to output (<0 means all)", &options.max, -1);
     ch_opt_addii(CH_OPTION_OPTIONAL,'n',"num-chars","Number of characters to output (<=0 means all)", &options.num, 64);
+
+    /* For modify options that support the OLD,NEW syntax, if NEW is not specified, this will produce a 'filtering' behavior */
+    /* E.g, the option '-e 0x643F5F010203' would cause packets only with DST MAC 64:3F:5F:01:02:03 to be present in the destination pcap */
     ch_opt_addsi(CH_OPTION_OPTIONAL,'e',"dst-mac","Edit DST MAC with syntax 'OLD,NEW' (eg. 0x643F5F010203,0xFFFFFFFFFFFF)", &options.dst_mac, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'E',"src-mac","Edit SRC MAC with syntax 'OLD,NEW' (eg. 0x643F5F010203,0xFFFFFFFFFFFF)", &options.src_mac, NULL);
+
+    /* Edit VLAN tags, with the syntax OLD,NEW */
+    /* To add a VLAN tag (e.g 100), specify 0,100 */
+    /* To delete a VLAN tag (e.g 100) specify 100,0 */
+    /* To change VLAN tags, (e.g 100 to 200) specify 100,200  */
     ch_opt_addii(CH_OPTION_OPTIONAL,'l',"add-vlan","Add a VLAN tag (eg. 100)", &options.add_vlan, 0);
     ch_opt_addii(CH_OPTION_OPTIONAL,'L',"del-vlan","Delete a VLAN tag (eg. 100)", &options.del_vlan, 0);
+
     ch_opt_addsi(CH_OPTION_OPTIONAL,'a',"src-ip","Edit SRC IP with syntax 'OLD,NEW' (eg. 192.168.0.1,172.16.0.1)", &options.src_ip, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'A',"dst-ip","Edit DST IP with syntax 'OLD,NEW' (eg. 192.168.0.1,172.16.0.1)", &options.dst_ip, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'p',"src-port","Edit SRC port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.src_port, NULL);
@@ -364,24 +407,20 @@ int main(int argc, char** argv)
     struct ethhdr old_eth_hdr = {0};
     struct ethhdr new_eth_hdr = {0};
     if(options.dst_mac){
-        if(parse_mac_addr(options.dst_mac, (unsigned char **)&old_eth_hdr.h_dest)){
-            ch_log_fatal("Failed to parse MAC address pair: %s\n", options.dst_mac);
-        }
-        if(parse_mac_addr(NULL, (unsigned char **)&new_eth_hdr.h_dest)){
+        if(parse_mac_opt(options.dst_mac, (unsigned char**)&old_eth_hdr.h_dest, (unsigned char**)&new_eth_hdr.h_dest) == -1){
             ch_log_fatal("Failed to parse MAC address pair: %s\n", options.dst_mac);
         }
     }
+
     if(options.src_mac){
-        if(parse_mac_addr(options.src_mac, (unsigned char **)&old_eth_hdr.h_source)){
-            ch_log_fatal("Failed to parse MAC address pair: %s\n", options.src_mac);
-        }
-        if(parse_mac_addr(NULL, (unsigned char **)&new_eth_hdr.h_source)){
+        if(parse_mac_opt(options.src_mac, (unsigned char**)&old_eth_hdr.h_source, (unsigned char**)&new_eth_hdr.h_source) == -1){
             ch_log_fatal("Failed to parse MAC address pair: %s\n", options.src_mac);
         }
     }
 
     struct vlan_ethhdr old_vlan_hdr = {0};
     struct vlan_ethhdr new_vlan_hdr = {0};
+
     old_vlan_hdr.h_vlan_proto = options.del_vlan ? htobe16(ETH_P_8021Q) : htobe16(ETH_P_IP);
     old_vlan_hdr.h_vlan_TCI = htobe16((u16)options.del_vlan);
 

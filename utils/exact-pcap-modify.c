@@ -348,6 +348,12 @@ static inline void copy_mac(unsigned char* dst, unsigned char* src)
     memcpy(dst, src, sizeof(unsigned char) * ETH_ALEN);
 }
 
+static inline int is_mac_valid(unsigned char* mac_addr)
+{
+    u64* mac = (u64*)mac_addr;
+    return (*mac << 16) != 0;
+}
+
 static inline int compare_vlan(struct vlan_ethhdr* lhs, struct vlan_ethhdr* rhs)
 {
     return lhs->h_vlan_proto == rhs->h_vlan_proto && lhs->h_vlan_TCI == rhs->h_vlan_TCI;
@@ -611,7 +617,7 @@ int main(int argc, char** argv)
         if(options.dst_mac){
             if(compare_mac(wr_eth_hdr->h_dest, old_eth_hdr.h_dest)){
                 matched.bits.dst_mac = 1;
-                if(new_eth_hdr.h_dest){
+                if(is_mac_valid(new_eth_hdr.h_dest)){
                     copy_mac(wr_eth_hdr->h_dest, new_eth_hdr.h_dest);
                     recalc_eth_crc = true;
                 }
@@ -620,7 +626,7 @@ int main(int argc, char** argv)
         if(options.src_mac){
             if(compare_mac(wr_eth_hdr->h_source, old_eth_hdr.h_source)){
                 matched.bits.src_mac = 1;
-                if(new_eth_hdr.h_source){
+                if(is_mac_valid(new_eth_hdr.h_source)){
                     copy_mac(wr_eth_hdr->h_source, new_eth_hdr.h_source);
                     recalc_eth_crc = true;
                 }
@@ -641,8 +647,8 @@ int main(int argc, char** argv)
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
                         /* Need to set the encapsulated proto, as we've only copied the eth header at this point */
                         wr_vlan_hdr->h_vlan_encapsulated_proto = rd_vlan_hdr->h_vlan_encapsulated_proto;
-                        tmp_wr_buff.offset += VLAN_HLEN;
                         pbuf += VLAN_HLEN;
+                        tmp_wr_buff.offset += VLAN_HLEN;
                         recalc_eth_crc = true;
                     }
                     /* Do we want to delete the vlan tag */
@@ -675,6 +681,14 @@ int main(int argc, char** argv)
                 }
             }
         }
+        else{
+            if(rd_vlan_hdr->h_vlan_proto == htobe16(ETH_P_8021Q)){
+                memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, pbuf, VLAN_HLEN);
+                pbuf += VLAN_HLEN;
+                tmp_wr_buff.offset += VLAN_HLEN;
+            }
+        }
+
 
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
@@ -805,9 +819,10 @@ int main(int argc, char** argv)
             match_wr_buff.offset += pcap_copy_bytes;
             matched_out++;
         }
+        /* Otherwise, write the original packet out */
         else if (options.write_filtered){
-            memcpy(filter_wr_buff.data + filter_wr_buff.offset, tmp_wr_buff.data, pcap_copy_bytes);
-            filter_wr_buff.offset += pcap_copy_bytes;
+            memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);
+            filter_wr_buff.offset += sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
             filtered_out++;
         }
 
@@ -823,6 +838,7 @@ int main(int argc, char** argv)
 
     if(options.write_filtered){
         flush_to_disk(&filter_wr_buff, filtered_out);
+        close(filter_wr_buff.fd);
     }
 
     ch_log_info("Modified %li packets\n", matched_out);

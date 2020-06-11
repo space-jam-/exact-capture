@@ -63,8 +63,6 @@ struct {
     char* dst_mac;
     char* src_mac;
     char* vlan;
-    ch_word add_vlan;
-    ch_word del_vlan;
     char* src_ip;
     char* dst_ip;
     char* src_port;
@@ -560,6 +558,7 @@ int main(int argc, char** argv)
     int64_t timeprevns = 0;
     int64_t matched_out = 0;
     int64_t filtered_out = 0;
+    const int64_t vlan_bytes = !old_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI ? VLAN_HLEN : 0;
     for(int pkt_num = 0; (!stop) && (pkt_num < options.offset + options.max) && offset < filesize; pkt_num++,
     timeprevns = timenowns ){
         bool recalc_eth_crc = false;
@@ -591,13 +590,12 @@ int main(int argc, char** argv)
         }
 
         char *pkt_start = pbuf;
-        const int64_t vlan_bytes = options.add_vlan > 0 && !options.del_vlan ? VLAN_HLEN : 0;
-        int64_t pcap_copy_bytes = sizeof(pcap_pkthdr_t) + pkt_hdr->caplen + vlan_bytes;
+        int64_t pcap_copy_bytes = sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
 
-        if(match_wr_buff.offset + pcap_copy_bytes > WRITE_BUFF_SIZE){
+        if(match_wr_buff.offset + pcap_copy_bytes + vlan_bytes > WRITE_BUFF_SIZE){
             flush_to_disk(&match_wr_buff, matched_out);
         }
-        if(filter_wr_buff.offset + pcap_copy_bytes > WRITE_BUFF_SIZE){
+        if(filter_wr_buff.offset + pcap_copy_bytes + vlan_bytes > WRITE_BUFF_SIZE){
             flush_to_disk(&filter_wr_buff, filtered_out);
         }
 
@@ -667,8 +665,8 @@ int main(int argc, char** argv)
                 /* Is this an untagged packet */
                 if(!compare_vlan(rd_vlan_hdr, &old_vlan_hdr)){
                     matched.bits.vlan = 1;
+                    /* Do we want to add a new vlan tag */
                     if(new_vlan_hdr.h_vlan_TCI){
-                        /* Do we want to add a new vlan tag */
                         wr_vlan_hdr->h_vlan_proto = new_vlan_hdr.h_vlan_proto;
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
                         wr_vlan_hdr->h_vlan_encapsulated_proto = new_vlan_hdr.h_vlan_encapsulated_proto;
@@ -728,7 +726,7 @@ int main(int argc, char** argv)
                 const uint16_t udp_len = be16toh(rd_udp_hdr->len);
                 const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start);
 
-                /* copy the remaining packet bytes, minus the CRC. The frame may be padded out, which
+                /* copy the remaining packet bytes. The frame may be padded out, which
                    isn't detectable from IP/L4 headers */
                 memcpy(wr_udp_hdr, rd_udp_hdr, bytes_remaining);
                 pbuf += bytes_remaining;
@@ -800,6 +798,14 @@ int main(int argc, char** argv)
         }
 
         if(recalc_eth_crc || recalc_ip_csum || recalc_prot_csum){
+            /* If the packet length has shrunk to 60B (due to stripping a VLAN tag), leave the original CRC at the end of the packet and add a new one. */
+            /* Not sure what the correct behavior would be for runt frames smaller than 60B */
+            if(wr_hdr->len == 60){
+                wr_hdr->len += ETH_CRC_LEN;
+                wr_hdr->caplen += ETH_CRC_LEN;
+                tmp_wr_buff.offset += ETH_CRC_LEN;
+                pcap_copy_bytes += ETH_CRC_LEN;
+            }
             uint32_t* wr_crc = (uint32_t*)(tmp_wr_buff.data + tmp_wr_buff.offset - ETH_CRC_LEN);
             *wr_crc = 0;
             *wr_crc = crc32(((char *)wr_hdr + sizeof(pcap_pkthdr_t)), (wr_hdr->len - ETH_CRC_LEN));

@@ -287,6 +287,10 @@ static int parse_vlan_opt(char* str, u16* old_vlan, u16* new_vlan)
         new_tag = htobe16(parse_number(tok_new, 0).val_uint);
         *new_vlan = new_tag;
     }
+    else{
+        *new_vlan = 0xFFFF;
+    }
+
 
     return 0;
 }
@@ -355,6 +359,11 @@ static inline int is_mac_valid(unsigned char* mac_addr)
 static inline int compare_vlan(struct vlan_ethhdr* lhs, struct vlan_ethhdr* rhs)
 {
     return lhs->h_vlan_proto == rhs->h_vlan_proto && lhs->h_vlan_TCI == rhs->h_vlan_TCI;
+}
+
+static inline int is_8021q(struct vlan_ethhdr* vlan_hdr)
+{
+    return vlan_hdr->h_vlan_proto == htobe16(ETH_P_8021Q);
 }
 
 static inline void get_pseudo_iphdr(struct iphdr* ip_hdr, uint16_t hdr_len, struct pseudo_iphdr* hdro)
@@ -474,7 +483,6 @@ int main(int argc, char** argv)
     struct iphdr old_ip_hdr = {0};
     struct iphdr new_ip_hdr = {0};
     if(options.src_ip){
-        printf("parse src: %s\n", options.src_ip);
         if(parse_ip_opt(options.src_ip, &old_ip_hdr.saddr, &new_ip_hdr.saddr) == -1){
             ch_log_fatal("Failed to parse IP address: %s\n", options.src_ip);
         }
@@ -633,6 +641,11 @@ int main(int argc, char** argv)
 
         struct vlan_ethhdr* rd_vlan_hdr = (struct vlan_ethhdr*)rd_eth_hdr;
         struct vlan_ethhdr* wr_vlan_hdr = (struct vlan_ethhdr*)wr_eth_hdr;
+        if(is_8021q(rd_vlan_hdr)){
+            memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, pbuf, VLAN_HLEN);
+            pbuf += VLAN_HLEN;
+        }
+
         if(options.vlan){
             /* Are we looking for a tagged packet */
             if(old_vlan_hdr.h_vlan_TCI){
@@ -640,21 +653,18 @@ int main(int argc, char** argv)
                 if(compare_vlan(rd_vlan_hdr, &old_vlan_hdr)){
                     matched.bits.vlan = 1;
                     /* Do we want to change the vlan tag */
-                    if(new_vlan_hdr.h_vlan_TCI){
+                    if(new_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         /* Update with new VLAN tag */
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
                         /* Need to set the encapsulated proto, as we've only copied the eth header at this point */
                         wr_vlan_hdr->h_vlan_encapsulated_proto = rd_vlan_hdr->h_vlan_encapsulated_proto;
-                        pbuf += VLAN_HLEN;
-                        tmp_wr_buff.offset += VLAN_HLEN;
                         recalc_eth_crc = true;
                     }
                     /* Do we want to delete the vlan tag */
-                    else if(new_vlan_hdr.h_vlan_proto == htobe16(ETH_P_IP)){
+                    else if(new_vlan_hdr.h_vlan_proto == htobe16(ETH_P_IP) && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         wr_vlan_hdr->h_vlan_proto = new_vlan_hdr.h_vlan_proto;
                         wr_hdr->len -= VLAN_HLEN;
                         wr_hdr->caplen -= VLAN_HLEN;
-                        pbuf += VLAN_HLEN;
                         pcap_copy_bytes -= VLAN_HLEN;
                         recalc_eth_crc = true;
                     }
@@ -663,30 +673,24 @@ int main(int argc, char** argv)
             /* We are filtering for an untagged packet */
             else{
                 /* Is this an untagged packet */
-                if(!compare_vlan(rd_vlan_hdr, &old_vlan_hdr)){
+                if(!is_8021q(rd_vlan_hdr)){
                     matched.bits.vlan = 1;
                     /* Do we want to add a new vlan tag */
-                    if(new_vlan_hdr.h_vlan_TCI){
+                    if(new_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         wr_vlan_hdr->h_vlan_proto = new_vlan_hdr.h_vlan_proto;
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
                         wr_vlan_hdr->h_vlan_encapsulated_proto = new_vlan_hdr.h_vlan_encapsulated_proto;
                         wr_hdr->len += VLAN_HLEN;
                         wr_hdr->caplen += VLAN_HLEN;
-                        tmp_wr_buff.offset += VLAN_HLEN;
                         pcap_copy_bytes += VLAN_HLEN;
                         recalc_eth_crc = true;
                     }
                 }
             }
         }
-        else{
-            if(rd_vlan_hdr->h_vlan_proto == htobe16(ETH_P_8021Q)){
-                memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, pbuf, VLAN_HLEN);
-                pbuf += VLAN_HLEN;
-                tmp_wr_buff.offset += VLAN_HLEN;
-            }
+        if(is_8021q(wr_vlan_hdr)){
+            tmp_wr_buff.offset += VLAN_HLEN;
         }
-
 
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
@@ -818,7 +822,6 @@ int main(int argc, char** argv)
             memcpy(wr_pkt_ftr, rd_pkt_ftr, sizeof(expcap_pktftr_t));
             tmp_wr_buff.offset += sizeof(expcap_pktftr_t);
         }
-
         /* If our filter matches, write to matched buffer */
         if(matched.sum == filter.sum){
             memcpy(match_wr_buff.data + match_wr_buff.offset, tmp_wr_buff.data, pcap_copy_bytes);

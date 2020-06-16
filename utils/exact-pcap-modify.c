@@ -554,14 +554,6 @@ int main(int argc, char** argv)
         new_file(&filter_wr_buff, filter_file_seg);
     }
 
-    /* Packets are written here as they are processed */
-    buff_t tmp_wr_buff = {0};
-    /* We probably don't need 100M just for a temp buffer... make it 9KB? (ip mtu) */
-    tmp_wr_buff.data = calloc(1, WRITE_BUFF_SIZE);
-    if(!tmp_wr_buff.data){
-        ch_log_fatal("Could not allocate memory for temp buffer\n");
-    }
-
     int64_t timenowns = 0;
     int64_t timeprevns = 0;
     int64_t matched_out = 0;
@@ -608,15 +600,15 @@ int main(int argc, char** argv)
         }
 
         /* Copy pcap header to new packet */
-        pcap_pkthdr_t* wr_hdr = (pcap_pkthdr_t*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        pcap_pkthdr_t* wr_hdr = (pcap_pkthdr_t*)(match_wr_buff.data + match_wr_buff.offset);
         memcpy(wr_hdr, pkt_hdr, sizeof(pcap_pkthdr_t));
-        tmp_wr_buff.offset += sizeof(pcap_pkthdr_t);
+        match_wr_buff.offset += sizeof(pcap_pkthdr_t);
 
         /* Copy ethernet header to new packet */
         struct ethhdr* rd_eth_hdr = (struct ethhdr*)pbuf;
-        struct ethhdr* wr_eth_hdr = (struct ethhdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        struct ethhdr* wr_eth_hdr = (struct ethhdr*)(match_wr_buff.data + match_wr_buff.offset);
         memcpy(wr_eth_hdr, rd_eth_hdr, sizeof(struct ethhdr));
-        tmp_wr_buff.offset += sizeof(struct ethhdr);
+        match_wr_buff.offset += sizeof(struct ethhdr);
         pbuf += sizeof(struct ethhdr);
 
         /* Update Ethernet headers */
@@ -642,7 +634,7 @@ int main(int argc, char** argv)
         struct vlan_ethhdr* rd_vlan_hdr = (struct vlan_ethhdr*)rd_eth_hdr;
         struct vlan_ethhdr* wr_vlan_hdr = (struct vlan_ethhdr*)wr_eth_hdr;
         if(is_8021q(rd_vlan_hdr)){
-            memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, pbuf, VLAN_HLEN);
+            memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, VLAN_HLEN);
             pbuf += VLAN_HLEN;
         }
 
@@ -689,15 +681,15 @@ int main(int argc, char** argv)
             }
         }
         if(is_8021q(wr_vlan_hdr)){
-            tmp_wr_buff.offset += VLAN_HLEN;
+            match_wr_buff.offset += VLAN_HLEN;
         }
 
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
-        struct iphdr* wr_ip_hdr = (struct iphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        struct iphdr* wr_ip_hdr = (struct iphdr*)(match_wr_buff.data + match_wr_buff.offset);
         uint16_t rd_ip_hdr_len = rd_ip_hdr->ihl << 2;
-        memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
-        tmp_wr_buff.offset += rd_ip_hdr_len;
+        memcpy(match_wr_buff.data + match_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
+        match_wr_buff.offset += rd_ip_hdr_len;
         pbuf += rd_ip_hdr_len;
         if(options.src_ip){
             if(rd_ip_hdr->saddr == old_ip_hdr.saddr){
@@ -726,7 +718,7 @@ int main(int argc, char** argv)
         switch(wr_ip_hdr->protocol){
             case IPPROTO_UDP:{
                 struct udphdr* rd_udp_hdr = (struct udphdr*)pbuf;
-                struct udphdr* wr_udp_hdr = (struct udphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+                struct udphdr* wr_udp_hdr = (struct udphdr*)(match_wr_buff.data + match_wr_buff.offset);
                 const uint16_t udp_len = be16toh(rd_udp_hdr->len);
                 const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start);
 
@@ -734,7 +726,7 @@ int main(int argc, char** argv)
                    isn't detectable from IP/L4 headers */
                 memcpy(wr_udp_hdr, rd_udp_hdr, bytes_remaining);
                 pbuf += bytes_remaining;
-                tmp_wr_buff.offset += bytes_remaining;
+                match_wr_buff.offset += bytes_remaining;
 
                 if(options.src_port){
                     if(rd_udp_hdr->source == old_port_hdr.src){
@@ -765,12 +757,12 @@ int main(int argc, char** argv)
             }
             case IPPROTO_TCP:{
                 struct tcphdr* rd_tcp_hdr = (struct tcphdr*)pbuf;
-                struct tcphdr* wr_tcp_hdr = (struct tcphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+                struct tcphdr* wr_tcp_hdr = (struct tcphdr*)(match_wr_buff.data + match_wr_buff.offset);
                 const uint16_t tcp_len = be16toh(wr_ip_hdr->tot_len) - (wr_ip_hdr->ihl<<2);
                 const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start);
                 memcpy(wr_tcp_hdr, rd_tcp_hdr, bytes_remaining);
                 pbuf += bytes_remaining;
-                tmp_wr_buff.offset += bytes_remaining;
+                match_wr_buff.offset += bytes_remaining;
 
                 if(options.src_port){
                     if(rd_tcp_hdr->source == old_port_hdr.src){
@@ -807,10 +799,10 @@ int main(int argc, char** argv)
             if(wr_hdr->len == 60){
                 wr_hdr->len += ETH_CRC_LEN;
                 wr_hdr->caplen += ETH_CRC_LEN;
-                tmp_wr_buff.offset += ETH_CRC_LEN;
+                match_wr_buff.offset += ETH_CRC_LEN;
                 pcap_copy_bytes += ETH_CRC_LEN;
             }
-            uint32_t* wr_crc = (uint32_t*)(tmp_wr_buff.data + tmp_wr_buff.offset - ETH_CRC_LEN);
+            uint32_t* wr_crc = (uint32_t*)(match_wr_buff.data + match_wr_buff.offset - ETH_CRC_LEN);
             *wr_crc = 0;
             *wr_crc = crc32(((char *)wr_hdr + sizeof(pcap_pkthdr_t)), (wr_hdr->len - ETH_CRC_LEN));
         }
@@ -818,26 +810,24 @@ int main(int argc, char** argv)
         /* If expcap trailer present, copy over */
         if(expcap){
             expcap_pktftr_t* rd_pkt_ftr = (expcap_pktftr_t*)pbuf;
-            expcap_pktftr_t* wr_pkt_ftr = (expcap_pktftr_t*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+            expcap_pktftr_t* wr_pkt_ftr = (expcap_pktftr_t*)(match_wr_buff.data + match_wr_buff.offset);
             memcpy(wr_pkt_ftr, rd_pkt_ftr, sizeof(expcap_pktftr_t));
-            tmp_wr_buff.offset += sizeof(expcap_pktftr_t);
+            match_wr_buff.offset += sizeof(expcap_pktftr_t);
         }
-        /* If our filter matches, write to matched buffer */
         if(matched.sum == filter.sum){
-            memcpy(match_wr_buff.data + match_wr_buff.offset, tmp_wr_buff.data, pcap_copy_bytes);
-            match_wr_buff.offset += pcap_copy_bytes;
             matched_out++;
         }
-        /* Otherwise, write the original packet out */
-        else if (options.write_filtered){
-            memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);
-            filter_wr_buff.offset += sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
-            filtered_out++;
+        else{
+            /* If a destintation for non-matching packets was specified, copy the filtered packet there. */
+            if (options.write_filtered){
+                memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);
+                filter_wr_buff.offset += sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
+                filtered_out++;
+            }
+            /* Wipe the match buffer */
+            match_wr_buff.offset -= pcap_copy_bytes;
+            memset(match_wr_buff.data + match_wr_buff.offset, 0, pcap_copy_bytes);
         }
-
-        /* Wipe the temp buffer */
-        memset(tmp_wr_buff.data, 0, pcap_copy_bytes);
-        tmp_wr_buff.offset = 0;
     }
 
     munmap(data, filesize);

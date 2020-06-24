@@ -468,6 +468,17 @@ int main (int argc, char** argv)
             pkt_hdr.caplen;
 
         ch_hash_map_it hmit = hash_map_get_first (hmap, pbuf, caplen);
+        if(hmit.key)
+        {
+            value_t* val = (value_t*) hmit.value;
+            /* Ensure that there is only a single match for a packet */
+            while(val->matched_once && hmit.key)
+            {
+                hmit = hash_map_get_next(hmit);
+                val = (value_t*) hmit.value;
+            }
+        }
+
         if (!hmit.key)
         {
             total_lost++;

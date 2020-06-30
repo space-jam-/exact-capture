@@ -50,6 +50,7 @@ struct
     ch_word max_ref;
     ch_word max_inp;
     bool verbose;
+    ch_word max_dupes;
 } options;
 
 typedef struct
@@ -194,6 +195,7 @@ int main (int argc, char** argv)
     ch_opt_addii (CH_OPTION_OPTIONAL, 'M', "max-ref", "Max items in the reference file to match  (<0 means all)", &options.max_ref, -1);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'm', "max-inp", "Max items in input file to match (<0 means all)", &options.max_inp, -1);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'n', "num-chars", "Number of bytes from matched packets to output (<0 means all)", &options.num, 64);
+    ch_opt_addii (CH_OPTION_OPTIONAL, 'd', "max-dupes", "Maximum number of duplicate matches allowed for a single packet (default is 0).", &options.max_dupes, 0);
     ch_opt_addbi (CH_OPTION_FLAG, 'v', "verbose", "Printout verbose output", &options.verbose, false);
     ch_opt_parse (argc, argv);
     ch_log_info("Starting PCAP Matcher\n");
@@ -470,16 +472,18 @@ int main (int argc, char** argv)
         ch_hash_map_it hmit = hash_map_get_first (hmap, pbuf, caplen);
         if(hmit.key)
         {
+            ch_word num_matches = 0;
             value_t* val = (value_t*) hmit.value;
-            /* Ensure that there is only a single match for a packet */
-            while(val->matched_once && hmit.key)
+            while(val->matched_once && num_matches < options.max_dupes)
             {
                 hmit = hash_map_get_next(hmit);
                 val = (value_t*) hmit.value;
+                num_matches++;
             }
         }
 
-        if (!hmit.key)
+        value_t* val = (value_t*) hmit.value;
+        if (!hmit.key || val->matched_once)
         {
             total_lost++;
             if (fd_inp_miss > 0)
@@ -489,7 +493,6 @@ int main (int argc, char** argv)
         }
 
         total_matched++;
-        value_t* val = (value_t*) hmit.value;
         char* ref_pkt = (char*) hmit.key;
         pcap_pkthdr_t* ref_hdr = &val->pkt_hdr;
         expcap_pktftr_t* ref_ftr = &val->pkt_ftr;

@@ -48,6 +48,7 @@ USE_CH_OPTIONS;
 
 #define WRITE_BUFF_SIZE (128 * 1024 * 1024) /* 128MB */
 #define ETH_CRC_LEN 4
+#define ETH_MIN_FRAME_SIZE 64
 #define VLAN_HLEN 4
 
 struct {
@@ -67,6 +68,7 @@ struct {
     char* dst_ip;
     char* src_port;
     char* dst_port;
+    char* device_type;
 } options;
 
 typedef struct {
@@ -113,6 +115,11 @@ typedef union {
         u64 dst_port : 1;
     } bits ;
 } pkt_filter_t;
+
+enum devices{
+    NEXUS,
+    FUSION
+};
 
 static volatile bool stop = false;
 void signal_handler(int signum)
@@ -244,7 +251,6 @@ int read_packet(char* data, int64_t* offset, int64_t snaplen, pcap_pkthdr_t** pk
     *pkt_hdro = pkt_hdr;
 
     return 0;
-
 }
 
 static int str_to_mac(char* str, unsigned char** mac_out)
@@ -340,6 +346,19 @@ static int parse_port_opt(char *str, u16* old_port, u16* new_port)
     return -1;
 }
 
+static int parse_device_type(char *str, ch_word *device)
+{
+    if(strcmp("nexus3548", str) == 0){
+        *device = NEXUS;
+        return 0;
+    }
+    else if(strcmp("fusion", str) == 0){
+        *device = FUSION;
+        return 0;
+    }
+    return -1;
+}
+
 static inline int compare_mac(unsigned char* lhs, unsigned char* rhs)
 {
     return memcmp(lhs, rhs, sizeof(unsigned char) * ETH_ALEN) == 0;
@@ -415,6 +434,8 @@ int main(int argc, char** argv)
     ch_opt_addsi(CH_OPTION_OPTIONAL,'A',"dst-ip","Edit DST IP with syntax 'OLD,NEW' (eg. 192.168.0.1,172.16.0.1)", &options.dst_ip, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'p',"src-port","Edit SRC port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.src_port, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'P',"dst-port","Edit DST port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.dst_port, NULL);
+
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'d',"device-type","Adjust the behavior of pcap-modify to match the specified device [nexus3548 | fusion] (default is nexus3548)", &options.device_type, NULL);
 
     ch_opt_parse(argc,argv);
 
@@ -510,6 +531,13 @@ int main(int argc, char** argv)
         filter.bits.dst_port = 1;
     }
 
+    ch_word device = NEXUS;
+    if(options.device_type){
+        if(parse_device_type(options.device_type, &device) == -1){
+            ch_log_fatal("Failed to parse device type: %s\n", options.device_type);
+        }
+    }
+
     char* data = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE , fd, 0);
     if(data == MAP_FAILED){
         ch_log_fatal("Could not map input file %s: \"%s\"\n", options.input, strerror(errno));
@@ -552,14 +580,6 @@ int main(int argc, char** argv)
         }
         filter_wr_buff.filename = options.write_filtered;
         new_file(&filter_wr_buff, filter_file_seg);
-    }
-
-    /* Packets are written here as they are processed */
-    buff_t tmp_wr_buff = {0};
-    /* We probably don't need 100M just for a temp buffer... make it 9KB? (ip mtu) */
-    tmp_wr_buff.data = calloc(1, WRITE_BUFF_SIZE);
-    if(!tmp_wr_buff.data){
-        ch_log_fatal("Could not allocate memory for temp buffer\n");
     }
 
     int64_t timenowns = 0;
@@ -608,15 +628,15 @@ int main(int argc, char** argv)
         }
 
         /* Copy pcap header to new packet */
-        pcap_pkthdr_t* wr_hdr = (pcap_pkthdr_t*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        pcap_pkthdr_t* wr_hdr = (pcap_pkthdr_t*)(match_wr_buff.data + match_wr_buff.offset);
         memcpy(wr_hdr, pkt_hdr, sizeof(pcap_pkthdr_t));
-        tmp_wr_buff.offset += sizeof(pcap_pkthdr_t);
+        match_wr_buff.offset += sizeof(pcap_pkthdr_t);
 
         /* Copy ethernet header to new packet */
         struct ethhdr* rd_eth_hdr = (struct ethhdr*)pbuf;
-        struct ethhdr* wr_eth_hdr = (struct ethhdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        struct ethhdr* wr_eth_hdr = (struct ethhdr*)(match_wr_buff.data + match_wr_buff.offset);
         memcpy(wr_eth_hdr, rd_eth_hdr, sizeof(struct ethhdr));
-        tmp_wr_buff.offset += sizeof(struct ethhdr);
+        match_wr_buff.offset += sizeof(struct ethhdr);
         pbuf += sizeof(struct ethhdr);
 
         /* Update Ethernet headers */
@@ -642,7 +662,7 @@ int main(int argc, char** argv)
         struct vlan_ethhdr* rd_vlan_hdr = (struct vlan_ethhdr*)rd_eth_hdr;
         struct vlan_ethhdr* wr_vlan_hdr = (struct vlan_ethhdr*)wr_eth_hdr;
         if(is_8021q(rd_vlan_hdr)){
-            memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, pbuf, VLAN_HLEN);
+            memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, VLAN_HLEN);
             pbuf += VLAN_HLEN;
         }
 
@@ -689,15 +709,15 @@ int main(int argc, char** argv)
             }
         }
         if(is_8021q(wr_vlan_hdr)){
-            tmp_wr_buff.offset += VLAN_HLEN;
+            match_wr_buff.offset += VLAN_HLEN;
         }
 
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
-        struct iphdr* wr_ip_hdr = (struct iphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+        struct iphdr* wr_ip_hdr = (struct iphdr*)(match_wr_buff.data + match_wr_buff.offset);
         uint16_t rd_ip_hdr_len = rd_ip_hdr->ihl << 2;
-        memcpy(tmp_wr_buff.data + tmp_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
-        tmp_wr_buff.offset += rd_ip_hdr_len;
+        memcpy(match_wr_buff.data + match_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
+        match_wr_buff.offset += rd_ip_hdr_len;
         pbuf += rd_ip_hdr_len;
         if(options.src_ip){
             if(rd_ip_hdr->saddr == old_ip_hdr.saddr){
@@ -726,15 +746,15 @@ int main(int argc, char** argv)
         switch(wr_ip_hdr->protocol){
             case IPPROTO_UDP:{
                 struct udphdr* rd_udp_hdr = (struct udphdr*)pbuf;
-                struct udphdr* wr_udp_hdr = (struct udphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+                struct udphdr* wr_udp_hdr = (struct udphdr*)(match_wr_buff.data + match_wr_buff.offset);
                 const uint16_t udp_len = be16toh(rd_udp_hdr->len);
-                const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start);
+                const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start) - ETH_CRC_LEN;
 
                 /* copy the remaining packet bytes. The frame may be padded out, which
                    isn't detectable from IP/L4 headers */
                 memcpy(wr_udp_hdr, rd_udp_hdr, bytes_remaining);
                 pbuf += bytes_remaining;
-                tmp_wr_buff.offset += bytes_remaining;
+                match_wr_buff.offset += bytes_remaining;
 
                 if(options.src_port){
                     if(rd_udp_hdr->source == old_port_hdr.src){
@@ -765,12 +785,12 @@ int main(int argc, char** argv)
             }
             case IPPROTO_TCP:{
                 struct tcphdr* rd_tcp_hdr = (struct tcphdr*)pbuf;
-                struct tcphdr* wr_tcp_hdr = (struct tcphdr*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+                struct tcphdr* wr_tcp_hdr = (struct tcphdr*)(match_wr_buff.data + match_wr_buff.offset);
                 const uint16_t tcp_len = be16toh(wr_ip_hdr->tot_len) - (wr_ip_hdr->ihl<<2);
-                const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start);
+                const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start) - ETH_CRC_LEN;
                 memcpy(wr_tcp_hdr, rd_tcp_hdr, bytes_remaining);
                 pbuf += bytes_remaining;
-                tmp_wr_buff.offset += bytes_remaining;
+                match_wr_buff.offset += bytes_remaining;
 
                 if(options.src_port){
                     if(rd_tcp_hdr->source == old_port_hdr.src){
@@ -801,43 +821,59 @@ int main(int argc, char** argv)
             }
         }
 
-        if(recalc_eth_crc || recalc_ip_csum || recalc_prot_csum){
-            /* If the packet length has shrunk to 60B (due to stripping a VLAN tag), leave the original CRC at the end of the packet and add a new one. */
-            /* Not sure what the correct behavior would be for runt frames smaller than 60B */
-            if(wr_hdr->len == 60){
-                wr_hdr->len += ETH_CRC_LEN;
-                wr_hdr->caplen += ETH_CRC_LEN;
-                tmp_wr_buff.offset += ETH_CRC_LEN;
-                pcap_copy_bytes += ETH_CRC_LEN;
+        /* If the packet length has shrunk to < 64B (due to stripping a VLAN tag) */
+        /* leave the original CRC at the end of the packet and add a new one. */
+        if(wr_hdr->len < ETH_MIN_FRAME_SIZE){
+            ch_word eth_pad_bytes = ETH_MIN_FRAME_SIZE - wr_hdr->len;
+
+            /* Nexus switches add 0x00 bytes as padding */
+            if(device == NEXUS){
+                memset(match_wr_buff.data + match_wr_buff.offset, 0x00, eth_pad_bytes);
             }
-            uint32_t* wr_crc = (uint32_t*)(tmp_wr_buff.data + tmp_wr_buff.offset - ETH_CRC_LEN);
-            *wr_crc = 0;
-            *wr_crc = crc32(((char *)wr_hdr + sizeof(pcap_pkthdr_t)), (wr_hdr->len - ETH_CRC_LEN));
+            /* Fusion switches copy the old bytes over */
+            if(device == FUSION){
+                memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, eth_pad_bytes);
+            }
+
+            wr_hdr->len += eth_pad_bytes;
+            wr_hdr->caplen += eth_pad_bytes;
+            match_wr_buff.offset += eth_pad_bytes;
+            pcap_copy_bytes += eth_pad_bytes;
         }
+
+        uint32_t *rd_eth_crc = (uint32_t *)pbuf;
+        uint32_t *wr_eth_crc = (uint32_t *)(match_wr_buff.data + match_wr_buff.offset);
+        *wr_eth_crc = *rd_eth_crc;
+
+        if(recalc_eth_crc || recalc_ip_csum || recalc_prot_csum){
+            *wr_eth_crc = 0;
+            *wr_eth_crc = crc32(((char *)wr_hdr + sizeof(pcap_pkthdr_t)), (wr_hdr->len - ETH_CRC_LEN));
+        }
+        match_wr_buff.offset += ETH_CRC_LEN;
+        pbuf += ETH_CRC_LEN;
 
         /* If expcap trailer present, copy over */
         if(expcap){
             expcap_pktftr_t* rd_pkt_ftr = (expcap_pktftr_t*)pbuf;
-            expcap_pktftr_t* wr_pkt_ftr = (expcap_pktftr_t*)(tmp_wr_buff.data + tmp_wr_buff.offset);
+            expcap_pktftr_t* wr_pkt_ftr = (expcap_pktftr_t*)(match_wr_buff.data + match_wr_buff.offset);
             memcpy(wr_pkt_ftr, rd_pkt_ftr, sizeof(expcap_pktftr_t));
-            tmp_wr_buff.offset += sizeof(expcap_pktftr_t);
-        }
-        /* If our filter matches, write to matched buffer */
-        if(matched.sum == filter.sum){
-            memcpy(match_wr_buff.data + match_wr_buff.offset, tmp_wr_buff.data, pcap_copy_bytes);
-            match_wr_buff.offset += pcap_copy_bytes;
-            matched_out++;
-        }
-        /* Otherwise, write the original packet out */
-        else if (options.write_filtered){
-            memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);
-            filter_wr_buff.offset += sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
-            filtered_out++;
+            match_wr_buff.offset += sizeof(expcap_pktftr_t);
         }
 
-        /* Wipe the temp buffer */
-        memset(tmp_wr_buff.data, 0, pcap_copy_bytes);
-        tmp_wr_buff.offset = 0;
+        if(matched.sum != filter.sum){
+            /* No match, wipe the written packet */
+            memset(wr_hdr, 0x00, pcap_copy_bytes);
+            match_wr_buff.offset -= pcap_copy_bytes;
+            /* If a destination to write filtered packets to was specified, copy the original packet there. */
+            if(options.write_filtered){
+                memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);
+                filter_wr_buff.offset += sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
+                filtered_out++;
+            }
+        }
+        else{
+            matched_out++;
+        }
     }
 
     munmap(data, filesize);

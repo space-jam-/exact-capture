@@ -66,6 +66,7 @@ struct {
     char* vlan;
     char* src_ip;
     char* dst_ip;
+    char* ip_ttl;
     char* src_port;
     char* dst_port;
     char* device_type;
@@ -111,6 +112,7 @@ typedef union {
         u64 vlan : 1;
         u64 src_ip : 1;
         u64 dst_ip : 1;
+        u64 ip_ttl : 1;
         u64 src_port : 1;
         u64 dst_port : 1;
     } bits ;
@@ -326,24 +328,37 @@ static int parse_ip_opt(char* str, u32* old_ip, u32* new_ip)
     return 0;
 }
 
-static int parse_port_opt(char *str, u16* old_port, u16* new_port)
+static int parse_u16_opt(char *str, u16* old_val, u16* new_val)
 {
     char *tok_old = strtok(str, ",");
     char *tok_new = strtok(NULL, ",");
-    u16 old_p, new_p;
+    u16 old, new;
 
-    if(!tok_new && str){
-        old_p = htobe16(parse_number(tok_old, 0).val_uint);
-        *old_port = old_p;
-        return 0;
-    }
+    old = htobe16(parse_number(tok_old, 0).val_uint);
+    *old_val = old;
 
     if(tok_new){
-        new_p = htobe16(parse_number(tok_new, 0).val_uint);
-        *new_port = new_p;
-        return 0;
+        new = htobe16(parse_number(tok_new, 0).val_uint);
+        *new_val = new;
     }
-    return -1;
+    return 0;
+}
+
+
+static int parse_u8_opt(char *str, u8* old_val, u8* new_val)
+{
+    char *tok_old = strtok(str, ",");
+    char *tok_new = strtok(NULL, ",");
+    u8 old, new;
+
+    old = parse_number(tok_old, 0).val_uint;
+    *old_val = old;
+
+    if(tok_new){
+        new = parse_number(tok_new, 0).val_uint;
+        *new_val = new;
+    }
+    return 0;
 }
 
 static int parse_device_type(char *str, ch_word *device)
@@ -429,13 +444,14 @@ int main(int argc, char** argv)
     /* To change VLAN tags, (e.g 100 to 200) specify 100,200 */
     /* As with other options supporting the OLD,NEW syntax, passing in '-l 100' would cause only packets with VLAN tag 100  */
     /* to be present in the destination capture  */
-    ch_opt_addsi(CH_OPTION_OPTIONAL,'l',"vlan","Edit a VLAN tag with syntax 'OLD,NEW' (eg. 100,200)", &options.vlan, 0);
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'l',"vlan","Edit a VLAN tag with syntax 'OLD,NEW' (eg. 100,200)", &options.vlan, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'a',"src-ip","Edit SRC IP with syntax 'OLD,NEW' (eg. 192.168.0.1,172.16.0.1)", &options.src_ip, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'A',"dst-ip","Edit DST IP with syntax 'OLD,NEW' (eg. 192.168.0.1,172.16.0.1)", &options.dst_ip, NULL);
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'T',"ip-ttl","Edit IP TTL with syntax 'OLD,NEW' (eg. 64,63)", &options.ip_ttl, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'p',"src-port","Edit SRC port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.src_port, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'P',"dst-port","Edit DST port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.dst_port, NULL);
 
-    ch_opt_addsi(CH_OPTION_OPTIONAL,'d',"device-type","Adjust the behavior of pcap-modify to match the specified device [nexus3548 | fusion] (default is nexus3548)", &options.device_type, NULL);
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'d',"device-type","Adjust the behavior of pcap-modify to match the specified device [nexus3548 | fusion]", &options.device_type, "nexus3548");
 
     ch_opt_parse(argc,argv);
 
@@ -515,17 +531,23 @@ int main(int argc, char** argv)
         }
         filter.bits.dst_ip = 1;
     }
+    if(options.ip_ttl){
+        if(parse_u8_opt(options.ip_ttl, &old_ip_hdr.ttl, &new_ip_hdr.ttl) == -1){
+            ch_log_fatal("Failed to parse IP ttl: %s\n", options.ip_ttl);
+        }
+        filter.bits.ip_ttl = 1;
+    }
 
     struct port_hdr old_port_hdr = {0};
     struct port_hdr new_port_hdr = {0};
     if(options.src_port){
-        if(parse_port_opt(options.src_port, &old_port_hdr.src, &new_port_hdr.src) == -1){
+        if(parse_u16_opt(options.src_port, &old_port_hdr.src, &new_port_hdr.src) == -1){
             ch_log_fatal("Failed to parse SRC port: %s\n", options.src_port);
         }
         filter.bits.src_port = 1;
     }
     if(options.dst_port){
-        if(parse_port_opt(options.dst_port, &old_port_hdr.dst, &new_port_hdr.dst) == -1){
+        if(parse_u16_opt(options.dst_port, &old_port_hdr.dst, &new_port_hdr.dst) == -1){
             ch_log_fatal("Failed to parse DST port: %s\n", options.dst_port);
         }
         filter.bits.dst_port = 1;
@@ -737,6 +759,19 @@ int main(int argc, char** argv)
                 }
             }
         }
+        if(options.ip_ttl){
+            //printf("my ttl: %d\n", old_ip_hdr.ttl);
+            if(rd_ip_hdr->ttl == old_ip_hdr.ttl){
+                matched.bits.ip_ttl = 1;
+
+                if(new_ip_hdr.ttl){
+
+                    wr_ip_hdr->ttl = new_ip_hdr.ttl;
+                    recalc_ip_csum = true;
+                }
+            }
+        }
+
         if(recalc_ip_csum){
             wr_ip_hdr->check = 0;
             wr_ip_hdr->check = csum((unsigned char*)wr_ip_hdr, wr_ip_hdr->ihl<<2, wr_ip_hdr->check);

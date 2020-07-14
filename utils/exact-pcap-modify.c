@@ -367,6 +367,11 @@ static int parse_device_type(char *str, ch_word *device)
         *device = NEXUS;
         return 0;
     }
+    /* Treat triton as though it were a nexus switch */
+    if(strcmp("triton", str) == 0){
+        *device = NEXUS;
+        return 0;
+    }
     else if(strcmp("fusion", str) == 0){
         *device = FUSION;
         return 0;
@@ -760,12 +765,9 @@ int main(int argc, char** argv)
             }
         }
         if(options.ip_ttl){
-            //printf("my ttl: %d\n", old_ip_hdr.ttl);
             if(rd_ip_hdr->ttl == old_ip_hdr.ttl){
                 matched.bits.ip_ttl = 1;
-
                 if(new_ip_hdr.ttl){
-
                     wr_ip_hdr->ttl = new_ip_hdr.ttl;
                     recalc_ip_csum = true;
                 }
@@ -837,7 +839,7 @@ int main(int argc, char** argv)
                     }
                 }
                 if(options.dst_port){
-                    if(rd_tcp_hdr->source == new_port_hdr.dst){
+                    if(rd_tcp_hdr->dest == old_port_hdr.dst){
                         matched.bits.dst_port = 1;
                         if(new_port_hdr.dst){
                             wr_tcp_hdr->dest = new_port_hdr.dst;
@@ -857,7 +859,6 @@ int main(int argc, char** argv)
         }
 
         /* If the packet length has shrunk to < 64B (due to stripping a VLAN tag) */
-        /* leave the original CRC at the end of the packet and add a new one. */
         if(wr_hdr->len < ETH_MIN_FRAME_SIZE){
             ch_word eth_pad_bytes = ETH_MIN_FRAME_SIZE - wr_hdr->len;
 

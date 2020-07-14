@@ -238,20 +238,6 @@ void next_packet(buff_t* buff)
 
 
 
-static void dump_buf(char *buf, ssize_t len)
-{
-    int i;
-
-    for (i = 0; i < len; i++)
-    {
-        if ((i % 16) == 0)
-            fprintf(stderr, "\n  %04x ", i);
-        fprintf(stderr, " %02x", (uint8_t)buf[i]);
-    }
-    fprintf(stderr, "\n");
-}
-
-
 /**
  * Main loop sets up threads and listens for stats / configuration messages.
  */

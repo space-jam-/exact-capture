@@ -40,9 +40,6 @@
 USE_CH_LOGGER_DEFAULT; //(CH_LOG_LVL_DEBUG3, true, CH_LOG_OUT_STDERR, NULL);
 USE_CH_OPTIONS;
 
-#define ETH_TYPE_IP htobe16(0x0800)
-#define ETH_TYPE_8021Q htobe16(0x8100)
-
 bool lstop = 0;
 
 static struct
@@ -60,7 +57,6 @@ static struct
     ch_bool skip_runts;
     ch_word hpt_device;
     ch_word hpt_port;
-    ch_word ip_proto;
 } options;
 
 enum out_format_type {
@@ -266,7 +262,6 @@ int main (int argc, char** argv)
     ch_opt_addbi (CH_OPTION_FLAG,     'r', "skip-runts", "Skip runt packets", &options.skip_runts, false);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'D', "hpt-device", "Fusion HPT device-tagged packets to extract", &options.hpt_device, -1);
     ch_opt_addii (CH_OPTION_OPTIONAL, 't', "hpt-port", "Fusion HPT port-tagged packets to extract", &options.hpt_port, -1);
-    ch_opt_addii (CH_OPTION_OPTIONAL, 'P', "ip-proto", "IP protocol of packets to extract (eg. 6 for TCP, 17 for UDP)", &options.ip_proto, -1);
     ch_opt_parse (argc, argv);
 
     options.max_file *= 1024 * 1024; /* Convert max file size from MB to B */
@@ -510,22 +505,6 @@ begin_loop:
 
         /* TODO add more comprehensive filtering in here */
         char* pkt_data = (char *)(pkt_hdr + 1);
-
-        /* lazy filtering implementation */
-        if (options.ip_proto > 0)
-        {
-            uint16_t* eth_type = (uint16_t *)&pkt_data[12];
-            uint8_t* ip_proto;
-            if (*eth_type == ETH_TYPE_IP)
-                ip_proto = (uint8_t *)&pkt_data[23];
-            else if (*eth_type == ETH_TYPE_8021Q)
-                ip_proto = (uint8_t *)&pkt_data[27];
-            else
-                goto next_packet;
-
-            if (*ip_proto != options.ip_proto)
-                goto next_packet;
-        }
 
         fusion_hpt_trailer_t* hpt_trailer = (fusion_hpt_trailer_t *)((pkt_data + packet_len) - sizeof(fusion_hpt_trailer_t));
 

@@ -120,7 +120,9 @@ typedef union {
 
 enum devices{
     NEXUS,
-    FUSION
+    FUSION,
+    TRITON,
+    ARISTA_EOS
 };
 
 static volatile bool stop = false;
@@ -132,6 +134,7 @@ void signal_handler(int signum)
     }
     stop = 1;
 }
+
 
 /* Open a new file for output, as a buff_t */
 void new_file(buff_t* wr_buff, int file_num)
@@ -367,13 +370,16 @@ static int parse_device_type(char *str, ch_word *device)
         *device = NEXUS;
         return 0;
     }
-    /* Treat triton as though it were a nexus switch */
-    if(strcmp("triton", str) == 0){
-        *device = NEXUS;
+    else if(strcmp("triton", str) == 0){
+        *device = TRITON;
         return 0;
     }
     else if(strcmp("fusion", str) == 0){
         *device = FUSION;
+        return 0;
+    }
+    else if(strcmp("arista7150", str) == 0){
+        *device = ARISTA_EOS;
         return 0;
     }
     return -1;
@@ -403,6 +409,15 @@ static inline int compare_vlan(struct vlan_ethhdr* lhs, struct vlan_ethhdr* rhs)
 static inline int is_8021q(struct vlan_ethhdr* vlan_hdr)
 {
     return vlan_hdr->h_vlan_proto == htobe16(ETH_P_8021Q);
+}
+
+static inline int is_ipv4(struct ethhdr* eth_hdr, struct vlan_ethhdr* vlan_hdr)
+{
+    if(is_8021q(vlan_hdr)){
+        return vlan_hdr->h_vlan_encapsulated_proto == htobe16(ETH_P_IP);
+    }
+
+    return eth_hdr->h_proto == htobe16(ETH_P_IP);
 }
 
 static inline void get_pseudo_iphdr(struct iphdr* ip_hdr, uint16_t hdr_len, struct pseudo_iphdr* hdro)
@@ -456,7 +471,7 @@ int main(int argc, char** argv)
     ch_opt_addsi(CH_OPTION_OPTIONAL,'p',"src-port","Edit SRC port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.src_port, NULL);
     ch_opt_addsi(CH_OPTION_OPTIONAL,'P',"dst-port","Edit DST port with syntax 'OLD,NEW' (eg. 5000, 51000)", &options.dst_port, NULL);
 
-    ch_opt_addsi(CH_OPTION_OPTIONAL,'d',"device-type","Adjust the behavior of pcap-modify to match the specified device [nexus3548 | fusion]", &options.device_type, "nexus3548");
+    ch_opt_addsi(CH_OPTION_OPTIONAL,'d',"device-type","Adjust the behavior of pcap-modify to match the specified device [nexus3548 | fusion | triton | arista7150]", &options.device_type, "nexus3548");
 
     ch_opt_parse(argc,argv);
 
@@ -514,10 +529,10 @@ int main(int argc, char** argv)
         parse_vlan_opt(options.vlan, &old_vlan_hdr.h_vlan_TCI, &new_vlan_hdr.h_vlan_TCI);
         filter.bits.vlan = 1;
 
-        /* if an old vlan tag was specified, proto is 8021q */
+        /* If an old vlan tag was specified, proto is 8021q */
         old_vlan_hdr.h_vlan_proto = old_vlan_hdr.h_vlan_TCI ? htobe16(ETH_P_8021Q) : htobe16(ETH_P_IP);
 
-        /* if a new vlan tag was specified, proto is 8021q, encapsulate IP */
+        /* If a new vlan tag was specified, proto is 8021q, encapsulate IP */
         new_vlan_hdr.h_vlan_proto = new_vlan_hdr.h_vlan_TCI ? htobe16(ETH_P_8021Q) : htobe16(ETH_P_IP);
         new_vlan_hdr.h_vlan_encapsulated_proto = htobe16(ETH_P_IP);
     }
@@ -646,7 +661,6 @@ int main(int argc, char** argv)
 
         char *pkt_start = pbuf;
         int64_t pcap_copy_bytes = sizeof(pcap_pkthdr_t) + pkt_hdr->caplen;
-
         if(match_wr_buff.offset + pcap_copy_bytes + vlan_bytes > WRITE_BUFF_SIZE){
             flush_to_disk(&match_wr_buff, matched_out);
         }
@@ -693,13 +707,14 @@ int main(int argc, char** argv)
             pbuf += VLAN_HLEN;
         }
 
+        /* Is a vlan option set */
         if(options.vlan){
-            /* Are we looking for a tagged packet */
+            /* Is the selected option to filter for tagged packets */
             if(old_vlan_hdr.h_vlan_TCI){
-                /* Is this the VLAN tag we're looking for */
+                /* Does the vlan tag match the requested tag */
                 if(compare_vlan(rd_vlan_hdr, &old_vlan_hdr)){
                     matched.bits.vlan = 1;
-                    /* Do we want to change the vlan tag */
+                    /* Should the vlan tag be changed */
                     if(new_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         /* Update with new VLAN tag */
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
@@ -717,12 +732,12 @@ int main(int argc, char** argv)
                     }
                 }
             }
-            /* We are filtering for an untagged packet */
+            /* Is the selected option to filter for untagged packets */
             else{
                 /* Is this an untagged packet */
                 if(!is_8021q(rd_vlan_hdr)){
                     matched.bits.vlan = 1;
-                    /* Do we want to add a new vlan tag */
+                    /* Should a new vlan tag be added */
                     if(new_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         wr_vlan_hdr->h_vlan_proto = new_vlan_hdr.h_vlan_proto;
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
@@ -738,6 +753,16 @@ int main(int argc, char** argv)
         if(is_8021q(wr_vlan_hdr)){
             match_wr_buff.offset += VLAN_HLEN;
         }
+
+        /* Don't process L3/L4 headers for non IPv4 frames. */
+        if(!is_ipv4(rd_eth_hdr, rd_vlan_hdr)){
+            const uint64_t bytes_remaining = pkt_hdr->len - (pbuf - pkt_start) - ETH_CRC_LEN;
+            memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, bytes_remaining);
+            pbuf += bytes_remaining;
+            match_wr_buff.offset += bytes_remaining;
+            goto calc_eth_crc;
+        }
+
 
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
@@ -858,6 +883,7 @@ int main(int argc, char** argv)
             }
         }
 
+    calc_eth_crc:
         /* If the packet length has shrunk to < 64B (due to stripping a VLAN tag) */
         if(wr_hdr->len < ETH_MIN_FRAME_SIZE){
             ch_word eth_pad_bytes = ETH_MIN_FRAME_SIZE - wr_hdr->len;
@@ -867,7 +893,7 @@ int main(int argc, char** argv)
                 memset(match_wr_buff.data + match_wr_buff.offset, 0x00, eth_pad_bytes);
             }
             /* Fusion switches copy the old bytes over */
-            if(device == FUSION){
+            if(device == FUSION || device == TRITON){
                 memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, eth_pad_bytes);
             }
 
@@ -897,9 +923,10 @@ int main(int argc, char** argv)
         }
 
         if(matched.sum != filter.sum){
-            /* No match, wipe the written packet */
+            /* No match, wipe the copied packet */
             memset(wr_hdr, 0x00, pcap_copy_bytes);
             match_wr_buff.offset -= pcap_copy_bytes;
+
             /* If a destination to write filtered packets to was specified, copy the original packet there. */
             if(options.write_filtered){
                 memcpy(filter_wr_buff.data + filter_wr_buff.offset, pkt_hdr, sizeof(pcap_pkthdr_t) + pkt_hdr->caplen);

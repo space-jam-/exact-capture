@@ -45,7 +45,7 @@
 ch_log_settings_t ch_log_settings = {
     .log_level      = CH_LOG_LVL_DEBUG1,
     .use_color      = false,
-    .output_mode    = CH_LOG_OUT_STDERR,
+    .output_mode    = CH_LOG_OUT_STDOUT,
     .filename       = NULL,
     .use_utc        = false,
     .incl_timezone  = false,
@@ -191,7 +191,6 @@ typedef struct
 
 int64_t load_trace(bool expcap, timespecps_t* trace_start, timespecps_t* trace_stop)
 {
-
     ch_log_info("PCAP analyser, opening file...\n");
     int fd = open(options.input,O_RDONLY);
     if(fd < 0){
@@ -300,7 +299,12 @@ int64_t load_trace(bool expcap, timespecps_t* trace_start, timespecps_t* trace_s
             double mpps = (double)window_stats.packet_count / window_ns * 1000.0;
             double gbps = (double)window_stats.bytes_total / window_ns * 8.0;
 
-            ch_log_info("offset=%i window=%.3lfms ipt=[%.3fns < %3.fns < %.3fns] size=[%iB < %0.3fB < %iB] rate=[%.3lfMpps < %.3lfMpps < %.3lfMpps] %.3lfMpps %0.2lfGbps\n",
+            const int64_t secs  = pkt_hdr->ts.ns.ts_sec;
+            const int64_t nsecs = pkt_hdr->ts.ns.ts_nsec;
+
+            printf("[%lld.%lld]: ", (long long)secs, (long long)nsecs);
+
+            printf("offset=%i window=%.3lfms ipt=[%.3fns < %3.fns < %.3fns] size=[%iB < %0.3fB < %iB] rate=[%.3lfMpps < %.3lfMpps < %.3lfMpps] %.3lfMpps %0.2lfGbps\n",
                     pkt_num,
                     window_ns /1000/1000.0,
 
@@ -443,8 +447,8 @@ int main(int argc, char** argv)
     ch_log_info("#########################################################\n");
 
 
-
     ch_log_info("PCAP analyzer, finished\n");
+    result = 0;
     return result;
 
 }

@@ -508,13 +508,16 @@ begin_loop:
 
         fusion_hpt_trailer_t* hpt_trailer = (fusion_hpt_trailer_t *)((pkt_data + packet_len) - sizeof(fusion_hpt_trailer_t));
 
-        const bool extract_hpt_only = (options.hpt_device > -1 && options.hpt_port > -1);
-        if(extract_hpt_only)
-            if(options.hpt_device != hpt_trailer->device_id || options.hpt_port != hpt_trailer->port)
+        const bool extract_hpt = options.hpt_device > -1 || options.hpt_port > -1;
+        if(extract_hpt){
+            if((options.hpt_device > -1 && options.hpt_device != hpt_trailer->device_id) ||
+               (options.hpt_port > -1 && options.hpt_port !=  hpt_trailer->port)) {
                 goto next_packet;
+            }
+        }
 
         /* HPT trailers will be stripped in the final capture, original FCS is kept */
-        const int64_t packet_copy_bytes = MIN(options.snaplen, packet_len - ((extract_hpt_only) ? sizeof(fusion_hpt_trailer_t) - 4 : 0));
+        const int64_t packet_copy_bytes = MIN(options.snaplen, packet_len - ((extract_hpt) ? sizeof(fusion_hpt_trailer_t) - 4 : 0));
         const int64_t pcap_record_bytes = sizeof(pcap_pkthdr_t) + packet_copy_bytes + sizeof(expcap_pktftr_t);
 
         ch_log_debug1("header bytes=%li\n", sizeof(pcap_pkthdr_t));
@@ -532,7 +535,6 @@ begin_loop:
 
         if(file_full || wr_buff.offset + pcap_record_bytes > WRITE_BUFF_SIZE)
         {
-
             flush_to_disk(&wr_buff, &file_bytes_written, packets_total);
 
             if(file_full){
@@ -545,7 +547,7 @@ begin_loop:
         }
 
 
-        /* Copy the packet header, and upto snap len packet data bytes, minus the HPT trailer if present */
+        /* Copy the packet header, and upto snap len packet data bytes */
         const int64_t copy_bytes =  sizeof(pcap_pkthdr_t) + packet_copy_bytes;
 
         ch_log_debug1("Copying %li bytes from buffer %li at index=%li into buffer at offset=%li\n", copy_bytes, min_idx, rd_buffs[min_idx].pkt_idx, wr_buff.offset);
@@ -554,16 +556,24 @@ begin_loop:
 
         /* Update the packet header in case snaplen is less than the original capture */
         pcap_pkthdr_t* wr_pkt_hdr = (pcap_pkthdr_t*)(wr_buff.data + wr_buff.offset);
-        wr_pkt_hdr->len = packet_copy_bytes; // Update the wire length as HPT trailer may be stripped
+        /* Update the wire length as HPT trailer may be stripped */
+        wr_pkt_hdr->len = packet_copy_bytes;
         wr_pkt_hdr->caplen = packet_copy_bytes;
 
-        const double hpt_frac = ldexp((double)be40toh(hpt_trailer->frac_seconds), -40);
-        const uint64_t hpt_psecs = hpt_frac * 1000 * 1000 * 1000 * 1000;
+        double hpt_frac = 0;
+        uint64_t hpt_psecs = 0;
+        uint64_t hpt_secs = 0;
+        if (extract_hpt) {
+            hpt_frac = ldexp((double)be40toh(hpt_trailer->frac_seconds), -40);
+            hpt_psecs = hpt_frac * 1000 * 1000 * 1000 * 1000;
+            hpt_secs = be32toh(hpt_trailer->seconds_since_epoch);
+        }
+
         /* Extract the timestamp from the footer */
         expcap_pktftr_t* pkt_ftr = (expcap_pktftr_t*)((char*)(pkt_hdr + 1)
                 + pkt_hdr->caplen - sizeof(expcap_pktftr_t));
-        const uint64_t secs          = (extract_hpt_only) ? be32toh(hpt_trailer->seconds_since_epoch) : pkt_ftr->ts_secs;
-        const uint64_t psecs         = (extract_hpt_only) ? hpt_psecs : pkt_ftr->ts_psecs;
+        const uint64_t secs          = (extract_hpt) ? hpt_secs : pkt_ftr->ts_secs;
+        const uint64_t psecs         = (extract_hpt) ? hpt_psecs : pkt_ftr->ts_psecs;
         const uint64_t psecs_mod1000 = psecs % 1000;
         const uint64_t psecs_floor   = psecs - psecs_mod1000;
         const uint64_t psecs_rounded = psecs_mod1000 >= 500 ? psecs_floor + 1000 : psecs_floor ;

@@ -96,14 +96,6 @@ struct port_hdr {
     uint16_t dst;
 };
 
-struct pseudo_iphdr {
-    uint32_t saddr;
-    uint32_t daddr;
-    uint8_t zero;
-    uint8_t protocol;
-    uint16_t len;
-} __attribute__((packed));
-
 typedef union {
     u64 sum;
     struct {
@@ -420,15 +412,6 @@ static inline int is_ipv4(struct ethhdr* eth_hdr, struct vlan_ethhdr* vlan_hdr)
     return eth_hdr->h_proto == htobe16(ETH_P_IP);
 }
 
-static inline void get_pseudo_iphdr(struct iphdr* ip_hdr, uint16_t hdr_len, struct pseudo_iphdr* hdro)
-{
-    hdro->saddr = ip_hdr->saddr;
-    hdro->daddr = ip_hdr->daddr;
-    hdro->zero = 0;
-    hdro->protocol = ip_hdr->protocol;
-    hdro->len = hdr_len;
-}
-
 int main(int argc, char** argv)
 {
     ch_word result = -1;
@@ -526,7 +509,9 @@ int main(int argc, char** argv)
     struct vlan_ethhdr old_vlan_hdr = {0};
     struct vlan_ethhdr new_vlan_hdr = {0};
     if(options.vlan){
-        parse_vlan_opt(options.vlan, &old_vlan_hdr.h_vlan_TCI, &new_vlan_hdr.h_vlan_TCI);
+        if (parse_vlan_opt(options.vlan, &old_vlan_hdr.h_vlan_TCI, &new_vlan_hdr.h_vlan_TCI) == -1){
+            ch_log_fatal("Failed to parse VLAN tag: %s\n", options.vlan);
+        }
         filter.bits.vlan = 1;
 
         /* If an old vlan tag was specified, proto is 8021q */
@@ -718,11 +703,11 @@ int main(int argc, char** argv)
                     if(new_vlan_hdr.h_vlan_TCI && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         /* Update with new VLAN tag */
                         wr_vlan_hdr->h_vlan_TCI = new_vlan_hdr.h_vlan_TCI;
-                        /* Need to set the encapsulated proto, as we've only copied the eth header at this point */
+                        /* Need to set the encapsulated proto, as only the eth header is copied at this point */
                         wr_vlan_hdr->h_vlan_encapsulated_proto = rd_vlan_hdr->h_vlan_encapsulated_proto;
                         recalc_eth_crc = true;
                     }
-                    /* Do we want to delete the vlan tag */
+                    /* Should the vlan tag be deleted  */
                     else if(new_vlan_hdr.h_vlan_proto == htobe16(ETH_P_IP) && new_vlan_hdr.h_vlan_TCI != 0xFFFF){
                         wr_vlan_hdr->h_vlan_proto = new_vlan_hdr.h_vlan_proto;
                         wr_hdr->len -= VLAN_HLEN;
@@ -768,7 +753,7 @@ int main(int argc, char** argv)
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
         struct iphdr* wr_ip_hdr = (struct iphdr*)(match_wr_buff.data + match_wr_buff.offset);
         uint16_t rd_ip_hdr_len = rd_ip_hdr->ihl << 2;
-        memcpy(match_wr_buff.data + match_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
+        memcpy(wr_ip_hdr, rd_ip_hdr, rd_ip_hdr_len);
         match_wr_buff.offset += rd_ip_hdr_len;
         pbuf += rd_ip_hdr_len;
         if(options.src_ip){
@@ -801,7 +786,7 @@ int main(int argc, char** argv)
 
         if(recalc_ip_csum){
             wr_ip_hdr->check = 0;
-            wr_ip_hdr->check = csum((unsigned char*)wr_ip_hdr, wr_ip_hdr->ihl<<2, wr_ip_hdr->check);
+            wr_ip_hdr->check = csum((unsigned char*)wr_ip_hdr, rd_ip_hdr_len, wr_ip_hdr->check);
         }
 
         /* Modify protocol ports, recalc csums */
@@ -837,11 +822,8 @@ int main(int argc, char** argv)
                     }
                 }
                 if(recalc_prot_csum || recalc_ip_csum){
-                    struct pseudo_iphdr p_hdr;
                     wr_udp_hdr->check = 0;
-                    get_pseudo_iphdr(wr_ip_hdr, wr_udp_hdr->len, &p_hdr);
-                    uint16_t pseudo_csum = csum((unsigned char*)&p_hdr, sizeof(struct pseudo_iphdr), 0);
-                    wr_udp_hdr->check = csum((unsigned char*)wr_udp_hdr, udp_len, ~pseudo_csum);
+                    wr_udp_hdr->check = calc_l4_csum((uint8_t*)wr_udp_hdr, wr_ip_hdr, udp_len);
                 }
                 break;
             }
@@ -873,11 +855,8 @@ int main(int argc, char** argv)
                     }
                 }
                 if(recalc_prot_csum){
-                    struct pseudo_iphdr p_hdr;
                     wr_tcp_hdr->check = 0;
-                    get_pseudo_iphdr(wr_ip_hdr, htobe16(tcp_len), &p_hdr);
-                    uint16_t pseudo_csum = csum((unsigned char*)&p_hdr, sizeof(struct pseudo_iphdr), 0);
-                    wr_tcp_hdr->check = csum((unsigned char*)wr_tcp_hdr, tcp_len, ~pseudo_csum);
+                    wr_tcp_hdr->check = calc_l4_csum((uint8_t*)wr_tcp_hdr, wr_ip_hdr, tcp_len);
                 }
                 break;
             }

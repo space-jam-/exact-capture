@@ -1,6 +1,6 @@
 #include <stdint.h>
-#include <arpa/inet.h>
-#include <stdio.h>
+#include <netinet/ip.h>
+#include "src/data_structs/pseudo_ip_header.h"
 
 const uint32_t crc32_tab[] = {
 	0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
@@ -48,9 +48,9 @@ const uint32_t crc32_tab[] = {
 	0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
 };
 
-uint32_t crc32(const void *buf, size_t size)
+uint32_t crc32(const void* buf, size_t size)
 {
-    const uint8_t *p = buf;
+    const uint8_t* p = buf;
     uint32_t crc;
 
     crc = ~0U;
@@ -59,10 +59,10 @@ uint32_t crc32(const void *buf, size_t size)
     return crc ^ ~0U;
 }
 
-uint16_t csum(unsigned char *p, size_t len, uint16_t initial)
+uint16_t csum(uint8_t* buf, size_t len, uint16_t initial)
 {
     uint32_t sum = (uint32_t)(initial);
-    const uint16_t *u16 = (const uint16_t *)p;
+    const uint16_t *u16 = (const uint16_t*)buf;
 
     while (len >= (sizeof(*u16) * 4)) {
         sum += u16[0];
@@ -80,9 +80,28 @@ uint16_t csum(unsigned char *p, size_t len, uint16_t initial)
 
     /* if length is in odd bytes */
     if (len == 1)
-        sum += *((const uint8_t *)u16);
+        sum += *((const uint8_t*)u16);
 
     while(sum>>16)
         sum = (sum & 0xFFFF) + (sum>>16);
     return (uint16_t)~sum;
+}
+
+/* Format a pseudo IP header, used for UDP/TCP checksum calculation */
+inline void get_pseudo_iphdr(struct iphdr* ip_hdr, uint16_t hdr_len, struct pseudo_iphdr* hdro)
+{
+    hdro->saddr = ip_hdr->saddr;
+    hdro->daddr = ip_hdr->daddr;
+    hdro->zero = 0;
+    hdro->protocol = ip_hdr->protocol;
+    hdro->len = hdr_len;
+}
+
+uint16_t calc_l4_csum(uint8_t* buf, struct iphdr* ip_hdr, uint16_t len)
+{
+    struct pseudo_iphdr p_hdr;
+    uint16_t len_be = htobe16(len);
+    get_pseudo_iphdr(ip_hdr, len_be, &p_hdr);
+    uint16_t pseudo_csum = csum((uint8_t*)&p_hdr, sizeof(struct pseudo_iphdr), 0);
+    return csum(buf, len, ~pseudo_csum);
 }

@@ -34,7 +34,7 @@ bin/exact-pcap-match: utils/exact-pcap-match.c $(EXACTCAP_HDRS) $(LIBCAHSTE_HDRS
 	$(CC) $(CFLAGS) utils/exact-pcap-match.c $(LDFLAGS) -o $@ 
 
 bin/exact-pcap-extract: utils/exact-pcap-extract.c $(EXACTCAP_HDRS) $(LIBCAHSTE_HDRS)
-	$(CC) $(CFLAGS) utils/exact-pcap-extract.c $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) src/buff.c utils/exact-pcap-extract.c $(LDFLAGS) -o $@
 
 bin/exact-pcap-modify: utils/exact-pcap-modify.c $(EXACTCAP_HDRS) $(LIBCAHSTE_HDRS)
 	$(CC) $(CFLAGS) utils/exact-pcap-modify.c $(LDFLAGS) -o $@

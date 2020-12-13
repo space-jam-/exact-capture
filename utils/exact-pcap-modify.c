@@ -81,6 +81,7 @@ typedef struct {
     uint64_t filesize;
     uint64_t offset;
     uint64_t pkt_idx;
+    uint64_t file_seg;
 } buff_t;
 
 struct vlan_ethhdr {

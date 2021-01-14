@@ -10,7 +10,7 @@ typedef struct {
     uint64_t offset;
     uint64_t pkt_idx;
     int file_seg;
-    uint64_t file_offset;
+    uint64_t file_bytes_written;
 } buff_t;
 
 void read_file(buff_t* buff, char* filename);

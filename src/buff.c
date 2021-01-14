@@ -14,15 +14,15 @@
 /* Open a new file for output, as a buff_t */
 void new_file(buff_t* buff, int snaplen, bool usec)
 {
-    char full_filename[1024] = {0};
-    snprintf(full_filename, 1024, "%s_%i.pcap", buff->filename, buff->file_seg);
+    char full_filename[2048] = {0};
+    snprintf(full_filename, 2048, "%s_%i.pcap", buff->filename, buff->file_seg);
 
     ch_log_info("Opening output \"%s\"...\n",full_filename );
     buff->fd = open(full_filename, O_CREAT | O_TRUNC | O_WRONLY, 0666 );
-    if(buff->fd < 0)
-    {
-        ch_log_fatal("Could not open output file %s: \"%s\"",
-                     full_filename, strerror(errno));
+    if(buff->fd < 0){
+        ch_log_warning("Could not open output file %s : \"%s\"",
+                       full_filename, strerror(errno));
+        return 1;
     }
 
     /* TODO: Currently assumes PCAP output only, would be nice at add ERF */
@@ -38,8 +38,8 @@ void new_file(buff_t* buff, int snaplen, bool usec)
     ch_log_info("Writing PCAP header to fd=%i\n", buff->fd);
     if(write(buff->fd,&hdr,sizeof(hdr)) != sizeof(hdr))
     {
-        ch_log_fatal("Could not write PCAP header");
-        /*TDOD: handle this failure more gracefully */
+        ch_log_warning("Could not write PCAP header");
+        return 1;
     }
     close(buff->fd);
 }
@@ -91,6 +91,7 @@ void flush_to_disk(buff_t* buff)
         ch_log_fatal("Couldn't write all bytes: %s \n", strerror(errno));
     }
 
+    buff->file_bytes_written += written;
     buff->offset = 0;
     close(buff->fd);
 }

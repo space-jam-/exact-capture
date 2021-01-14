@@ -25,9 +25,12 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <math.h>
+#include <inttypes.h>
+#include <byteswap.h>
 
 #include <chaste/types/types.h>
 #include <chaste/data_structs/vector/vector_std.h>
+#include <chaste/data_structs/hash_map/hash_map.h>
 #include <chaste/options/options.h>
 #include <chaste/log/log.h>
 #include <chaste/timing/timestamp.h>
@@ -36,16 +39,18 @@
 #include "src/data_structs/pcap-structures.h"
 #include "src/data_structs/expcap.h"
 #include "src/data_structs/fusion_hpt.h"
+#include "src/data_structs/vlan_ethhdr.h"
+#include "src/buff.h"
 
 USE_CH_LOGGER_DEFAULT; //(CH_LOG_LVL_DEBUG3, true, CH_LOG_OUT_STDERR, NULL);
 USE_CH_OPTIONS;
-
 bool lstop = 0;
 
 static struct
 {
     CH_VECTOR(cstr)* reads;
     char* write;
+    char* write_dir;
     ch_word max_file;
     ch_word max_count;
     char* format;
@@ -55,8 +60,10 @@ static struct
     ch_word device;
     ch_bool all;
     ch_bool skip_runts;
-    ch_word hpt_device;
-    ch_word hpt_port;
+    ch_bool hpt_trailer;
+    ch_bool vlan_filter;
+    ch_bool hpt_filter;
+    ch_bool expcap_filter;
 } options;
 
 enum out_format_type {
@@ -94,20 +101,6 @@ void signal_handler (int signum)
     }
     lstop = 1;
 }
-
-
-typedef struct {
-    char* filename;
-    char* data;
-    pcap_pkthdr_t* pkt;
-    bool eof;
-    int fd;
-    uint64_t filesize;
-    uint64_t offset;
-    uint64_t pkt_idx;
-} buff_t;
-
-
 
 /* Return packet with earliest timestamp */
 int64_t min_packet_ts(int64_t buff_idx_lhs, int64_t buff_idx_rhs, buff_t* buffs)
@@ -157,82 +150,73 @@ int64_t min_packet_ts(int64_t buff_idx_lhs, int64_t buff_idx_rhs, buff_t* buffs)
 
 }
 
-/* Open a new file for output, as a buff_t */
-void new_file(buff_t* wr_buff, int file_num)
+int get_key_from_vlan(char* pbuf, pcap_pkthdr_t* hdr, uint16_t* key)
 {
-    char full_filename[1024] = {0};
-    snprintf(full_filename, 1024, "%s_%i.pcap", wr_buff->filename, file_num);
-
-    ch_log_info("Opening output \"%s\"...\n",full_filename );
-    wr_buff->fd = open(full_filename, O_CREAT | O_TRUNC | O_WRONLY, 0666 );
-    if(wr_buff->fd < 0)
-    {
-        ch_log_fatal("Could not open output file %s: \"%s\"",
-                     full_filename, strerror(errno));
+    if(hdr->len < sizeof(vlan_ethhdr_t)){
+        ch_log_error("Packet is too small %"PRIu64"to extract VLAN hdr\n", hdr->len);
+        return 1;
     }
 
-    /* TODO: Currently assumes PCAP output only, would be nice at add ERF */
-    /* Generate the output file header */
-    pcap_file_header_t hdr;
-    hdr.magic = options.usec ? TCPDUMP_MAGIC: NSEC_TCPDUMP_MAGIC;
-    hdr.version_major = PCAP_VERSION_MAJOR;
-    hdr.version_minor = PCAP_VERSION_MINOR;
-    hdr.thiszone = 0;
-    hdr.sigfigs = 0; /* 9? libpcap always writes 0 */
-    hdr.snaplen = options.snaplen + (ch_word)sizeof(expcap_pktftr_t);
-    hdr.linktype = DLT_EN10MB;
-    ch_log_info("Writing PCAP header to fd=%i\n", wr_buff->fd);
-    if(write(wr_buff->fd,&hdr,sizeof(hdr)) != sizeof(hdr))
-    {
-        ch_log_fatal("Could not write PCAP header"); 
-        /*TDOD: handle this failure more gracefully */
+    vlan_ethhdr_t* vlan_hdr = (vlan_ethhdr_t*)pbuf;
+    if(vlan_hdr->h_vlan_proto == 0x0081){
+        uint16_t vlan_id = bswap_16(vlan_hdr->h_vlan_TCI) & 0x0FFF;
+        *key = vlan_id;
+    } else {
+        *key = 0;
     }
-
+    return 0;
 }
 
-void flush_to_disk(buff_t* wr_buff, int64_t* file_bytes_written, int64_t packets_written)
+int get_key_from_hpt(char* pbuf, pcap_pkthdr_t* hdr, uint16_t* key)
 {
-    (void)packets_written;
-    (void)file_bytes_written;
-
-    //ch_log_info("Flushing %liB to fd=%i total=(%liMB) packets=%li\n", wr_buff->offset, wr_buff->fd, *file_bytes_written / 1024/ 1024, packets_written);
-    /* Not enough space in the buffer, time to flush it */
-    const uint64_t written = write(wr_buff->fd,wr_buff->data,wr_buff->offset);
-    if(written < wr_buff->offset)
-    {
-        ch_log_fatal("Couldn't write all bytes, fix this some time\n");
+    if(hdr->len < sizeof(fusion_hpt_trailer_t)){
+        ch_log_error("Packet is too small %"PRIu64"to extract HPT trailer\n", hdr->len);
+        return 1;
     }
 
-    wr_buff->offset = 0;
-
+    uint64_t trailer_offset = (hdr->len - sizeof(fusion_hpt_trailer_t));
+    fusion_hpt_trailer_t* trailer = (fusion_hpt_trailer_t*)(pbuf + trailer_offset);
+    uint8_t device = trailer->device_id;
+    uint8_t port = trailer->port;
+    *key = (uint16_t)device << 8 | (uint16_t)port;
+    return 0;
 }
 
-
-void next_packet(buff_t* buff)
+int get_key_from_expcap(char* pbuf, pcap_pkthdr_t* hdr, uint16_t* key)
 {
-    pcap_pkthdr_t* curr_pkt    = buff->pkt;
-    const int64_t curr_cap_len = curr_pkt->caplen;
-    ch_log_debug1("Skipping %li bytes ahead\n", curr_cap_len);
-    pcap_pkthdr_t* next_pkt    = (pcap_pkthdr_t*)((char*)(curr_pkt+1) + curr_cap_len);
-
-    buff->pkt = next_pkt;
-    buff->pkt_idx++;
-
-    /*Check if we've overflowed */
-    const uint64_t offset = (char*)next_pkt - buff->data;
-    buff->eof = offset >= buff->filesize;
-    if(buff->eof){
-        ch_log_warn("End of file \"%s\"\n", buff->filename);
+    if(hdr->caplen < sizeof(expcap_pktftr_t)){
+        ch_log_error("Packet is too small %"PRIu64"to extract expcap trailer\n", hdr->caplen);
+        return 1;
     }
 
+    uint64_t trailer_offset = (hdr->caplen - sizeof(expcap_pktftr_t));
+    expcap_pktftr_t* trailer = (expcap_pktftr_t*)(pbuf + trailer_offset);
+    uint8_t device = trailer->dev_id;
+    uint8_t port = trailer->port_id;
+    *key = (uint16_t)device << 8 | (uint16_t)port;
+    return 0;
+}
+
+int format_vlan_key(uint16_t key, char* format_str)
+{
+    if(key > 0){
+        snprintf(format_str, 1024, "_vlan-%u", key);
+    } else {
+        format_str[0] = '\0';
+    }
+    return 0;
+}
+
+int format_hpt_key(uint16_t key, char* format_str)
+{
+    uint8_t device = (uint8_t)(key >> 8);
+    uint8_t port = (uint8_t)key;
+    snprintf(format_str, 1024, "_device-%u_port-%u", device, port);
+    return 0;
 }
 
 #define READ_BUFF_SIZE (128 * 1024 * 1024) /* 128MB */
 #define WRITE_BUFF_SIZE (128 * 1024 * 1024) /* 128MB */
-
-
-
-
 
 /**
  * Main loop sets up threads and listens for stats / configuration messages.
@@ -250,7 +234,8 @@ int main (int argc, char** argv)
 //    ch_opt_short_description("Extracts PCAP and exPCAP files out of exact cap ecap files.");
 
     ch_opt_addSU (CH_OPTION_UNLIMTED, 'i', "input",    "exact-capture expcap files to extract from", &options.reads);
-    ch_opt_addsu (CH_OPTION_REQUIRED, 'w', "write",    "Destination to write output to", &options.write);
+    ch_opt_addsi (CH_OPTION_REQUIRED, 'w', "write",    "Destination to write output to", &options.write, NULL);
+    ch_opt_addsi (CH_OPTION_OPTIONAL, 'W', "write-dir", "Write output to a directory", &options.write_dir, NULL);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'p', "port",     "Port number to extract", &options.port,-1);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'd', "device",   "Device number to extract", &options.device,-1);
     ch_opt_addbi (CH_OPTION_FLAG,     'a', "all",      "Output packets from all ports/devices", &options.all, false);
@@ -260,87 +245,72 @@ int main (int argc, char** argv)
     ch_opt_addii (CH_OPTION_OPTIONAL, 'u', "usecpcap", "PCAP output in microseconds", &options.usec, false);
     ch_opt_addii (CH_OPTION_OPTIONAL, 'S', "snaplen",  "Maximum packet length", &options.snaplen, 1518);
     ch_opt_addbi (CH_OPTION_FLAG,     'r', "skip-runts", "Skip runt packets", &options.skip_runts, false);
-    ch_opt_addii (CH_OPTION_OPTIONAL, 'D', "hpt-device", "Fusion HPT device-tagged packets to extract", &options.hpt_device, -1);
-    ch_opt_addii (CH_OPTION_OPTIONAL, 't', "hpt-port", "Fusion HPT port-tagged packets to extract", &options.hpt_port, -1);
+    ch_opt_addbi (CH_OPTION_FLAG,     't', "hpt-trailer", "Extract timestamps from Fusion HPT trailers", &options.hpt_trailer, false);
+    ch_opt_addbi (CH_OPTION_FLAG,     'v', "vlan-filter", "Write to a new pcap for each VLAN tag in the input.", &options.vlan_filter, false);
+    ch_opt_addbi (CH_OPTION_FLAG,     'T', "HPT-filter", "Write to a new pcap based on Fusion HPT port/device.", &options.hpt_filter, false);
+    ch_opt_addbi (CH_OPTION_FLAG,     'P', "port-filter", "Write to a new pcap based on the expcap port/device.", &options.expcap_filter, false);
     ch_opt_parse (argc, argv);
 
     options.max_file *= 1024 * 1024; /* Convert max file size from MB to B */
 
     ch_log_settings.log_level = CH_LOG_LVL_DEBUG1;
 
+    if(!options.write && !options.write_dir){
+        ch_log_fatal("Must supply an output (-w file or -W directory)\n");
+    }
 
-    if(!options.all && (options.port == -1 || options.device == -1))
-    {
+    if(options.write_dir){
+        if(mkdir(options.write_dir, 0755) != 0){
+            ch_log_fatal("Failed to create directory %s : %s\n", options.write_dir, strerror(errno));
+        }
+    }
+
+    if(!options.all && (options.port == -1 || options.device == -1)){
         ch_log_fatal("Must supply a port and device number (--dev /--port) or use --all\n");
     }
 
-    if(options.reads->count == 0)
-    {
+    if(options.reads->count == 0){
         ch_log_fatal("Please supply input files\n");
+    }
+
+    int (*get_key)(char*, pcap_pkthdr_t*, uint16_t*) = NULL;
+    int (*format_key)(uint16_t, char*) = NULL;
+    if(options.vlan_filter){
+        get_key = &get_key_from_vlan;
+        format_key = &format_vlan_key;
+    } else if (options.hpt_filter) {
+        get_key = &get_key_from_hpt;
+        format_key = &format_hpt_key;
+    } else if (options.expcap_filter) {
+        get_key = &get_key_from_expcap;
+        format_key = format_hpt_key;
     }
 
     ch_log_debug1("Starting packet extractor...\n");
 
     /* Parse the format type */
     enum out_format_type format = EXTR_OPT_FORM_UNKNOWN;
-    for(int i = 0; i < OUT_FORMATS_COUNT; i++ )
-        if(strncmp(options.format, out_formats[i].cmdline, strlen(out_formats[i].cmdline))== 0 )
-        {
+    for(int i = 0; i < OUT_FORMATS_COUNT; i++ ){
+        if(strncmp(options.format, out_formats[i].cmdline, strlen(out_formats[i].cmdline))== 0 ){
             format = out_formats[i].type;
         }
-
-    if(format == EXTR_OPT_FORM_UNKNOWN)
-    {
+    }
+    if(format == EXTR_OPT_FORM_UNKNOWN){
         ch_log_fatal("Unknown output format type %s\n", options.format );
     }
 
-    buff_t wr_buff = {0};
-    wr_buff.data = calloc(1, WRITE_BUFF_SIZE);
-    if(!wr_buff.data)
-    {
-        ch_log_fatal("Could not allocate memory for write buffer\n");
-    }
-    wr_buff.filename = options.write;
-
+    buff_t* wr_buff = NULL;
+    uint16_t key;
+    ch_hash_map* hmap = ch_hash_map_new(65536, sizeof(buff_t), NULL);
 
     /* Allocate N read buffers where */
     const int64_t rd_buffs_count = options.reads->count;
     buff_t* rd_buffs = (buff_t*)calloc(rd_buffs_count, sizeof(buff_t));
-    if(!rd_buffs)
-    {
+    if(!rd_buffs){
         ch_log_fatal("Could not allocate memory for read buffers table\n");
     }
-    for(int i = 0; i < rd_buffs_count; i++)
-    {
-        rd_buffs[i].filename = options.reads->first[i];
-        ch_log_debug1("Opening input %s...\n",rd_buffs[i].filename );
-        rd_buffs[i].fd = open(rd_buffs[i].filename,O_RDONLY);
-        if(!rd_buffs[i].fd)
-        {
-            ch_log_fatal("Could not open input file %s: \"%s\"",
-                         rd_buffs[i].filename, strerror(errno));
-        }
-
-        struct stat st = {0};
-        if(stat(rd_buffs[i].filename, &st))
-        {
-            ch_log_fatal("Could not stat file %s: \"%s\"\n",
-                         rd_buffs[i].filename, strerror(errno));
-        }
-        rd_buffs[i].filesize = st.st_size;
-
-
-        rd_buffs[i].data = mmap(NULL, rd_buffs[i].filesize,
-                                  PROT_READ,
-                                  MAP_PRIVATE , //| MAP_POPULATE ,
-                                  rd_buffs[i].fd, 0);
-        ch_log_debug1("File mapped at %p\n", rd_buffs[i].data);
-        if(rd_buffs[i].data == MAP_FAILED)
-        {
-            ch_log_fatal("Could not map input file %s: \"%s\"\n",
-                             rd_buffs[i].filename, strerror(errno));
-        }
-
+    for(int i = 0; i < rd_buffs_count; i++){
+        read_file(&rd_buffs[i], options.reads->first[i]);
     }
 
     ch_log_info("starting main loop with %li buffers\n", rd_buffs_count);
@@ -351,18 +321,13 @@ int main (int argc, char** argv)
 
 
     /* Skip over the PCAP headers in each file */
-    for(int i = 0; i < rd_buffs_count; i++)
-    {
+    for(int i = 0; i < rd_buffs_count; i++){
         rd_buffs[i].pkt = (pcap_pkthdr_t*)(rd_buffs[i].data + sizeof(pcap_file_header_t));
     }
 
 
     /* Process the merge */
     ch_log_info("Beginning merge\n");
-    int64_t file_bytes_written = 0;
-    int64_t file_seg = 0;
-    new_file(&wr_buff, file_seg);
-
     int64_t packets_total   = 0;
     int64_t dropped_padding = 0;
     int64_t dropped_runts   = 0;
@@ -501,23 +466,23 @@ begin_loop:
 
 
         pcap_pkthdr_t* pkt_hdr = rd_buffs[min_idx].pkt;
-        const int64_t packet_len = (ch_word)pkt_hdr->caplen - (ch_word)sizeof(expcap_pktftr_t);
-
-        /* TODO add more comprehensive filtering in here */
+        const int64_t pkt_len = (ch_word)pkt_hdr->len;
         char* pkt_data = (char *)(pkt_hdr + 1);
 
-        fusion_hpt_trailer_t* hpt_trailer = (fusion_hpt_trailer_t *)((pkt_data + packet_len) - sizeof(fusion_hpt_trailer_t));
-
-        const bool extract_hpt = options.hpt_device > -1 || options.hpt_port > -1;
-        if(extract_hpt){
-            if((options.hpt_device > -1 && options.hpt_device != hpt_trailer->device_id) ||
-               (options.hpt_port > -1 && options.hpt_port !=  hpt_trailer->port)) {
-                goto next_packet;
-            }
+        const uint64_t trailer_size = options.hpt_trailer ? sizeof(fusion_hpt_trailer_t) : 0;
+        fusion_hpt_trailer_t* hpt_trailer;
+        uint64_t hpt_secs = 0;
+        uint64_t hpt_psecs = 0;
+        if(options.hpt_trailer){
+            double hpt_frac = 0;
+            hpt_trailer = (fusion_hpt_trailer_t*)(pkt_data + pkt_len - trailer_size);
+            hpt_frac = ldexp((double)be40toh(hpt_trailer->frac_seconds), -40);
+            hpt_psecs = hpt_frac * 1000 * 1000 * 1000 * 1000;
+            hpt_secs = bswap_32(hpt_trailer->seconds_since_epoch);
         }
 
         /* HPT trailers will be stripped in the final capture, original FCS is kept */
-        const int64_t packet_copy_bytes = MIN(options.snaplen, packet_len - ((extract_hpt) ? sizeof(fusion_hpt_trailer_t) - 4 : 0));
+        const int64_t packet_copy_bytes = MIN(options.snaplen, pkt_len - trailer_size + 4);
         const int64_t pcap_record_bytes = sizeof(pcap_pkthdr_t) + packet_copy_bytes + sizeof(expcap_pktftr_t);
 
         ch_log_debug1("header bytes=%li\n", sizeof(pcap_pkthdr_t));
@@ -525,24 +490,57 @@ begin_loop:
         ch_log_debug1("footer bytes=%li\n", sizeof(expcap_pktftr_t));
         ch_log_debug1("max pcap_record_bytes=%li\n", pcap_record_bytes);
 
+        if(get_key){
+            if(get_key(pkt_data, pkt_hdr, &key) != 0){
+                ch_log_fatal("Failed to extract key from packet!\n");
+            }
+        } else {
+            key = 0;
+        }
+
+        ch_hash_map_it hmit = hash_map_get_first(hmap, &key, sizeof(uint16_t));
+        if(hmit.key){
+            wr_buff = hmit.value;
+        } else {
+            buff_t buff = {0};
+            buff.data = calloc(1, WRITE_BUFF_SIZE);
+            if(!buff.data){
+                ch_log_fatal("Could not allocate memory for new buffer\n");
+            }
+
+            if(options.write_dir){
+                char format_str[1024];
+                buff.filename = (char*)malloc(1024);
+                if(!buff.filename){
+                    ch_log_fatal("Could not allocate memory for filename\n");
+                }
+                format_key(key, format_str);
+                snprintf(buff.filename, 1024, "%s/%s%s", options.write_dir, options.write, format_str);
+            } else {
+                buff.filename = options.write;
+            }
+            new_file(&buff, 0, options.usec);
+            hash_map_push(hmap, &key, sizeof(uint16_t), &buff);
+            wr_buff = &buff;
+        }
+
         ch_log_debug1("Buffer offset=%li, write_buff_size=%li, delta=%li\n",
-                      wr_buff.offset, WRITE_BUFF_SIZE,
-                      WRITE_BUFF_SIZE - wr_buff.offset);
+                      wr_buff->offset, WRITE_BUFF_SIZE,
+                      WRITE_BUFF_SIZE - wr_buff->offset);
 
         /* Flush the buffer if we need to */
         const bool file_full = options.max_file > 0 &&
-                 (file_bytes_written + pcap_record_bytes) > options.max_file ;
+                 (wr_buff->file_bytes_written + pcap_record_bytes) > options.max_file ;
 
-        if(file_full || wr_buff.offset + pcap_record_bytes > WRITE_BUFF_SIZE)
+        if(file_full || wr_buff->offset + pcap_record_bytes > WRITE_BUFF_SIZE)
         {
-            flush_to_disk(&wr_buff, &file_bytes_written, packets_total);
+            flush_to_disk(wr_buff);
 
             if(file_full){
                     ch_log_info("File is full. Closing\n");
-                    close(wr_buff.fd);
-                    file_seg++;
-                    file_bytes_written = 0;
-                    new_file(&wr_buff, file_seg);
+                    close(wr_buff->fd);
+                    wr_buff->file_seg++;
+                    new_file(wr_buff, options.snaplen, options.usec);
             }
         }
 
@@ -550,30 +548,21 @@ begin_loop:
         /* Copy the packet header, and upto snap len packet data bytes */
         const int64_t copy_bytes =  sizeof(pcap_pkthdr_t) + packet_copy_bytes;
 
-        ch_log_debug1("Copying %li bytes from buffer %li at index=%li into buffer at offset=%li\n", copy_bytes, min_idx, rd_buffs[min_idx].pkt_idx, wr_buff.offset);
-        memcpy(wr_buff.data + wr_buff.offset, pkt_hdr, copy_bytes);
+        ch_log_debug1("Copying %li bytes from buffer %li at index=%li into buffer at offset=%li\n", copy_bytes, min_idx, rd_buffs[min_idx].pkt_idx, wr_buff->offset);
+        memcpy(wr_buff->data + wr_buff->offset, pkt_hdr, copy_bytes);
         packets_total++;
 
         /* Update the packet header in case snaplen is less than the original capture */
-        pcap_pkthdr_t* wr_pkt_hdr = (pcap_pkthdr_t*)(wr_buff.data + wr_buff.offset);
+        pcap_pkthdr_t* wr_pkt_hdr = (pcap_pkthdr_t*)(wr_buff->data + wr_buff->offset);
         /* Update the wire length as HPT trailer may be stripped */
         wr_pkt_hdr->len = packet_copy_bytes;
         wr_pkt_hdr->caplen = packet_copy_bytes;
 
-        double hpt_frac = 0;
-        uint64_t hpt_psecs = 0;
-        uint64_t hpt_secs = 0;
-        if (extract_hpt) {
-            hpt_frac = ldexp((double)be40toh(hpt_trailer->frac_seconds), -40);
-            hpt_psecs = hpt_frac * 1000 * 1000 * 1000 * 1000;
-            hpt_secs = be32toh(hpt_trailer->seconds_since_epoch);
-        }
-
         /* Extract the timestamp from the footer */
         expcap_pktftr_t* pkt_ftr = (expcap_pktftr_t*)((char*)(pkt_hdr + 1)
                 + pkt_hdr->caplen - sizeof(expcap_pktftr_t));
-        const uint64_t secs          = (extract_hpt) ? hpt_secs : pkt_ftr->ts_secs;
-        const uint64_t psecs         = (extract_hpt) ? hpt_psecs : pkt_ftr->ts_psecs;
+        const uint64_t secs          = options.hpt_trailer ? hpt_secs : pkt_ftr->ts_secs;
+        const uint64_t psecs         = options.hpt_trailer ? hpt_psecs : pkt_ftr->ts_psecs;
         const uint64_t psecs_mod1000 = psecs % 1000;
         const uint64_t psecs_floor   = psecs - psecs_mod1000;
         const uint64_t psecs_rounded = psecs_mod1000 >= 500 ? psecs_floor + 1000 : psecs_floor ;
@@ -582,8 +571,8 @@ begin_loop:
         wr_pkt_hdr->ts.ns.ts_sec  = secs;
         wr_pkt_hdr->ts.ns.ts_nsec = nsecs;
 
-        wr_buff.offset += copy_bytes;
-        file_bytes_written += copy_bytes;
+        wr_buff->offset += copy_bytes;
+        wr_buff->file_bytes_written += copy_bytes;
 
         /* Include the footer (if we want it) */
         if(format == EXTR_OPT_FORM_EXPCAP)
@@ -591,9 +580,9 @@ begin_loop:
             expcap_pktftr_t wr_pkt_ftr = *pkt_ftr;
             wr_pkt_ftr.ts_secs = secs;
             wr_pkt_ftr.ts_psecs = psecs;
-            memcpy(wr_buff.data + wr_buff.offset, &wr_pkt_ftr, sizeof(expcap_pktftr_t));
-            wr_buff.offset     += sizeof(expcap_pktftr_t);
-            file_bytes_written += sizeof(expcap_pktftr_t);
+            memcpy(wr_buff->data + wr_buff->offset, &wr_pkt_ftr, sizeof(expcap_pktftr_t));
+            wr_buff->offset     += sizeof(expcap_pktftr_t);
+            wr_buff->file_bytes_written += sizeof(expcap_pktftr_t);
             wr_pkt_hdr->caplen += sizeof(expcap_pktftr_t);
         }
 
@@ -602,18 +591,21 @@ begin_loop:
             break;
         }
 
-
-
-    next_packet:
        /* Increment packet pointer to look at the next packet */
-
-        
        next_packet(&rd_buffs[min_idx]);
     }
 
     ch_log_info("Finished writing %li packets total (Runts=%li, Errors=%li (%li, %li, %li), Padding=%li). Closing\n", packets_total, dropped_runts, dropped_errors, dropped_errors_abrt, dropped_errors_crpt, dropped_errors_swofl, dropped_padding);
-    flush_to_disk(&wr_buff, &file_bytes_written, packets_total);
-    close(wr_buff.fd);
+
+    ch_hash_map_it hmit = hash_map_first(hmap);
+    while(hmit.value){
+        wr_buff = hmit.value;
+        flush_to_disk(wr_buff);
+        hash_map_next(hmap, &hmit);
+    }
+
+    flush_to_disk(wr_buff);
+    close(wr_buff->fd);
 
 
 

@@ -767,7 +767,7 @@ int main(int argc, char** argv)
         /* Modify IP header, recalc csum as needed */
         struct iphdr* rd_ip_hdr = (struct iphdr*)pbuf;
         struct iphdr* wr_ip_hdr = (struct iphdr*)(match_wr_buff.data + match_wr_buff.offset);
-        uint16_t rd_ip_hdr_len = rd_ip_hdr->ihl << 2;
+        const uint16_t rd_ip_hdr_len = rd_ip_hdr->ihl << 2;
         memcpy(match_wr_buff.data + match_wr_buff.offset, rd_ip_hdr, rd_ip_hdr_len);
         match_wr_buff.offset += rd_ip_hdr_len;
         pbuf += rd_ip_hdr_len;
@@ -879,6 +879,15 @@ int main(int argc, char** argv)
                     uint16_t pseudo_csum = csum((unsigned char*)&p_hdr, sizeof(struct pseudo_iphdr), 0);
                     wr_tcp_hdr->check = csum((unsigned char*)wr_tcp_hdr, tcp_len, ~pseudo_csum);
                 }
+                break;
+            }
+            /* Unknown protocol, leave L4 alone. */
+            default:{
+                const uint16_t ip_tot_len = be16toh(rd_ip_hdr->tot_len);
+                const uint64_t bytes_remaining = ip_tot_len - rd_ip_hdr_len;
+                memcpy(match_wr_buff.data + match_wr_buff.offset, pbuf, bytes_remaining);
+                pbuf += bytes_remaining;
+                match_wr_buff.offset += bytes_remaining;
                 break;
             }
         }
